@@ -535,7 +535,42 @@ class CityLearnEnv(Environment, Env):
         """Summed `Building.solar_generation, in [kWh]`."""
 
         return pd.DataFrame([b.solar_generation for b in self.buildings]).sum(axis=0, min_count=1).to_numpy()
+    
+    def calculate_energy_sharing(self):
+        # Step 1: Identify surplus and deficit buildings
+        surplus_buildings = [b for b in self.buildings if b.max_shared_energy > 0]
+        deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
+        if not surplus_buildings or not deficit_buildings:
+            return 0, {b.uid: 0 for b in self.buildings}, deficit_buildings
 
+        # Step 2: Prepare tracking variables
+        shared_energy_by_building = {b.uid: 0 for b in self.buildings}
+        total_shared_energy = 0.0
+
+        # Step 3: Sort deficit buildings by electricity price (higher prices prioritized)
+        deficit_buildings.sort(key=lambda b: -b.pricing.electricity_pricing[self.time_step])
+
+        # Step 4: Distribute energy from surplus buildings
+        for deficit_building in deficit_buildings:
+            deficit = deficit_building.net_electricity_consumption[self.time_step]
+
+            for surplus_building in surplus_buildings:
+                if deficit <= 0:
+                    break  # Move to the next deficit building
+
+                available_energy = surplus_building.max_shared_energy  # Use precomputed max shared energy
+                shared = min(deficit, available_energy)
+
+                # Update shared energy tracking
+                shared_energy_by_building[deficit_building.uid] += shared
+                total_shared_energy += shared
+
+                # Update buildings' energy states
+                surplus_building.net_electricity_consumption[self.time_step] += shared
+                deficit_building.net_electricity_consumption[self.time_step] -= shared
+
+        return total_shared_energy, shared_energy_by_building, deficit_buildings
+    
     @schema.setter
     def schema(self, schema: Union[str, Path, Mapping[str, Any]]):
         self.__schema = schema
@@ -630,9 +665,16 @@ class CityLearnEnv(Environment, Env):
 
         for building, building_actions in zip(self.buildings, actions):
             building.apply_actions(**building_actions)
+        # 🔹 Perform energy sharing after applying actions
+        total_shared_energy, shared_energy_by_building, deficit_buildings = self.calculate_energy_sharing()
+
+        # 🔹 Log shared energy information
+        LOGGER.info(f"Total Shared Energy: {total_shared_energy} kWh")
+        LOGGER.info(f"Shared Energy per Building: {shared_energy_by_building}")
+        LOGGER.info(f"Deficit Buildings: {[b.uid for b in deficit_buildings]}")
 
         self.next_time_step()
-        reward = self.reward_function.calculate()
+        reward = self.reward_function.calculate(self.observations) 
         self.__rewards.append(reward)
         return self.observations, reward, self.done, self.get_info()
 

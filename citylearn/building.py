@@ -360,6 +360,51 @@ class Building(Environment):
             cooling_electricity_consumption_difference,
             heating_electricity_consumption_difference
         ], axis=0)
+    
+    def surplus(self) -> float:
+        """Returns the total surplus energy available for sharing."""
+        net_consumption = np.array(self.net_electricity_consumption)
+        return np.sum(np.where(net_consumption < 0, -net_consumption, 0))  # Sum of surplus energy
+
+    def get_reservable_energy(self) -> float:
+        """Computes the energy that a surplus building should reserve before sharing excess energy."""
+        battery_reserve = 0.0
+        battery = getattr(self, 'electrical_storage', None)
+
+        if battery:
+            min_soc_p = 0.2  # Maintain at least 20% SOC
+            current_soc = battery.soc[self.time_step]
+            battery_capacity = battery.capacity
+            current_soc_p = current_soc / battery_capacity
+
+            if min_soc_p > current_soc_p:
+                battery_reserve = 0.0
+            else:
+                battery_reserve = min_soc_p * battery_capacity
+
+        total_ev_demand = 0.0
+        chargers = getattr(self, 'chargers', [])
+
+        if chargers:
+            for charger in chargers:
+                if charger is not None and charger.connected_ev is not None:
+                    ev = charger.connected_ev
+                    required_energy = ev.battery.capacity * (
+                        ev.ev_simulation.required_soc_departure[self.time_step] / 100 - ev.battery.soc[self.time_step] / 100
+                    )
+                    max_charge_power = min(charger.max_charging_power, required_energy)
+                    total_ev_demand += max(0, max_charge_power)
+
+        return battery_reserve + total_ev_demand
+
+    @property
+    def max_shared_energy(self) -> float:
+        """Computes the maximum energy that can be shared with other buildings."""
+        surplus = self.surplus()
+        reserved_energy = self.get_reservable_energy()
+        max_shareable_energy = max(0, surplus - reserved_energy)
+        return max_shareable_energy
+        
 
     @property
     def heating_demand_without_partial_load(self) -> np.ndarray:
