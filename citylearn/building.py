@@ -63,7 +63,7 @@ class Building(Environment):
             heating_storage: StorageTank = None, electrical_storage: Battery = None,
             dhw_device: Union[HeatPump, ElectricHeater] = None, cooling_device: HeatPump = None,
             heating_device: Union[HeatPump, ElectricHeater] = None, pv: PV = None, chargers: List[Charger] = None, reward_type: str = "D",
-            image_path: str = None, name: str = None, lat: float = None, lon : float = None, maximum_temperature_delta: float = None, **kwargs: Any
+            image_path: str = None, name: str = None, lat: float = None, lon : float = None, maximum_temperature_delta: float = None, min_reserved_power = None, **kwargs: Any
     ):
         r"""Initialize `Building`.
 
@@ -140,6 +140,7 @@ class Building(Environment):
         self.image_path = image_path
         self.__set_without_partial_load_variables()
         self.reward_type = reward_type
+        self.min_reserved_power = min_reserved_power
 
         arg_spec = inspect.getfullargspec(super().__init__)
         kwargs = {
@@ -225,6 +226,12 @@ class Building(Environment):
         """Reward Type"""
 
         return self.__reward_type
+    
+    @property
+    def min_reserved_power(self) -> float:
+        """Minimum reserved power in kW."""
+
+        return self.__min_reserved_power
 
     @property
     def dhw_device(self) -> Union[HeatPump, ElectricHeater]:
@@ -360,51 +367,6 @@ class Building(Environment):
             cooling_electricity_consumption_difference,
             heating_electricity_consumption_difference
         ], axis=0)
-    
-    def surplus(self) -> float:
-        """Returns the total surplus energy available for sharing."""
-        net_consumption = np.array(self.net_electricity_consumption)
-        return np.sum(np.where(net_consumption < 0, -net_consumption, 0))  # Sum of surplus energy
-
-    def get_reservable_energy(self) -> float:
-        """Computes the energy that a surplus building should reserve before sharing excess energy."""
-        battery_reserve = 0.0
-        battery = getattr(self, 'electrical_storage', None)
-
-        if battery:
-            min_soc_p = 0.2  # Maintain at least 20% SOC
-            current_soc = battery.soc[self.time_step]
-            battery_capacity = battery.capacity
-            current_soc_p = current_soc / battery_capacity
-
-            if min_soc_p > current_soc_p:
-                battery_reserve = 0.0
-            else:
-                battery_reserve = min_soc_p * battery_capacity
-
-        total_ev_demand = 0.0
-        chargers = getattr(self, 'chargers', [])
-
-        if chargers:
-            for charger in chargers:
-                if charger is not None and charger.connected_ev is not None:
-                    ev = charger.connected_ev
-                    required_energy = ev.battery.capacity * (
-                        ev.ev_simulation.required_soc_departure[self.time_step] / 100 - ev.battery.soc[self.time_step] / 100
-                    )
-                    max_charge_power = min(charger.max_charging_power, required_energy)
-                    total_ev_demand += max(0, max_charge_power)
-
-        return battery_reserve + total_ev_demand
-
-    @property
-    def max_shared_energy(self) -> float:
-        """Computes the maximum energy that can be shared with other buildings."""
-        surplus = self.surplus()
-        reserved_energy = self.get_reservable_energy()
-        max_shareable_energy = max(0, surplus - reserved_energy)
-        return max_shareable_energy
-        
 
     @property
     def heating_demand_without_partial_load(self) -> np.ndarray:
@@ -697,7 +659,17 @@ class Building(Environment):
         """Unique building name."""
 
         return self.__image_path
+    
+    @property 
+    def shared_energy(self) -> List[float]:
+        """Surplus energy available for sharing."""
+        return self.__shared_energy
 
+    @property
+    def surplus(self) -> List[float]:
+        """Surplus energy available for sharing."""
+        return self.__surplus
+    
     @image_path.setter
     def image_path(self, image_path: str):
         self.__image_path = image_path
@@ -804,6 +776,13 @@ class Building(Environment):
     def reward_type(self, reward_type: str):
         self.__reward_type = reward_type
 
+    @min_reserved_power.setter
+    def min_reserved_power(self, min_reserved_power: float):
+        if min_reserved_power is None:
+            min_reserved_power = 0.0  # Ensure it's always a valid float
+        assert min_reserved_power >= 0, 'min_reserved_power must be >= 0'
+        self.__min_reserved_power = min_reserved_power
+
     def observations(self, include_all: bool = None, normalize: bool = None, periodic_normalization: bool = None) -> \
             Mapping[str, float]:
         r"""Observations at current time step.
@@ -859,6 +838,7 @@ class Building(Environment):
                 self.energy_simulation.indoor_dry_bulb_temperature[self.time_step] -
                 self.energy_simulation.indoor_dry_bulb_temperature_set_point[self.time_step]),
             'occupant_count': self.energy_simulation.occupant_count[self.time_step],
+            'surplus': self.__surplus[self.time_step],
         }
 
         if include_all:
@@ -1481,6 +1461,8 @@ class Building(Environment):
         self.__net_electricity_consumption_cost = []
         self.__chargers_electricity_consumption = []
         self.__chargers_electricity_consumption_without_partial_load = []
+        self.__shared_energy = []
+        self.__surplus = []
         self.update_variables()
 
         # reset controlled variables
@@ -1544,7 +1526,7 @@ class Building(Environment):
         #print("Non-Shiftable Load:", self.energy_simulation.non_shiftable_load[self.time_step])
         #print("Solar Generation:", self.__solar_generation[self.time_step])
         #print("Chargers Electricity Consumption:", self.__chargers_electricity_consumption[self.time_step])
-
+        shared_energy = 0
         net_electricity_consumption = cooling_consumption \
                                       + heating_consumption \
                                       + dhw_consumption \
@@ -1552,7 +1534,22 @@ class Building(Environment):
                                       + self.energy_simulation.non_shiftable_load[self.time_step] \
                                       + self.__solar_generation[self.time_step] \
                                       + self.__chargers_electricity_consumption[self.time_step]
-        self.__net_electricity_consumption.append(net_electricity_consumption)
+                                    
+        updated_net_electricity_consumption = net_electricity_consumption - shared_energy
+        if net_electricity_consumption < 0:
+            surplus = net_electricity_consumption
+        else:
+            surplus = 0
+
+        min_reserved_power = 1.0 - self.min_reserved_power
+        # print(self.min_reserved_power)
+        # print(min_reserved_power)
+        # print(self.time_step)
+        shared_energy = min_reserved_power*surplus
+
+        self.__surplus.append(surplus)
+        self.__shared_energy.append(shared_energy)
+        self.__net_electricity_consumption.append(updated_net_electricity_consumption)
 
         # net electriciy consumption cost
         self.__net_electricity_consumption_cost.append(
@@ -1574,6 +1571,8 @@ class Building(Environment):
             f"\n  Carbon Intensity: {self.carbon_intensity}"
             f"\n  Pricing: {self.pricing}"
             f"\n  net elect consuption: {self.net_electricity_consumption}"
+            f"\n  surplus: {self.surplus}"
+            f"\n  shared energy: {self.shared_energy}"  
             f"\n  net elect consuption without storage: {self.net_electricity_consumption_without_storage}"
             f"\n  net elect consuption without storage an partial load: {self.net_electricity_consumption_without_storage_and_partial_load}"           
             #f"\n  Domestic Hot Water Storage: {self.dhw_storage}"

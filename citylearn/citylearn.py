@@ -79,13 +79,13 @@ class CityLearnEnv(Environment, Env):
                  buildings: Union[List[Building], List[str], List[int]] = None,
                  evs: Union[List[electric_vehicle], List[str], List[int]] = None, simulation_start_time_step: int = None,
                  simulation_end_time_step: int = None,
-                 reward_function: 'citylearn.reward_function.RewardFunction' = None, central_agent: bool = None,
+                 reward_function: 'citylearn.reward_function.RewardFunction' = None, central_agent: bool = None, min_reserved_power: float = None,
                  shared_observations: List[str] = None, **kwargs: Any
                  ):
         self.schema = schema
         self.__rewards = None
         self.root_directory, self.buildings, self.evs, self.simulation_start_time_step, self.simulation_end_time_step, self.seconds_per_time_step, \
-            self.reward_function, self.central_agent, self.shared_observations = self._load(
+            self.reward_function, self.central_agent,self.min_reserved_power, self.shared_observations = self._load(
             root_directory=root_directory,
             buildings=buildings,
             evs=evs,
@@ -93,6 +93,7 @@ class CityLearnEnv(Environment, Env):
             simulation_end_time_step=simulation_end_time_step,
             reward_function=reward_function,
             central_agent=central_agent,
+            min_reserved_power=min_reserved_power,
             shared_observations=shared_observations,
         )
         super().__init__(**kwargs)
@@ -132,6 +133,12 @@ class CityLearnEnv(Environment, Env):
         """Time step to end reading from data files."""
 
         return self.__simulation_end_time_step
+    
+    @property
+    def min_reserved_power(self) -> float:
+        """Minimum reserved power for the EV charger."""
+
+        return self.__min_reserved_power
 
     @property
     def time_steps(self) -> int:
@@ -386,6 +393,12 @@ class CityLearnEnv(Environment, Env):
         """Summed `Building.net_electricity_consumption` time series, in [kWh]."""
 
         return self.__net_electricity_consumption
+    
+    @property 
+    def secondary_storage(self) -> List[float]:
+        """Summed 'Building.shared_energy' time series, in [kWh]."""
+
+        return self.__secondary_storage
 
     @property
     def cooling_electricity_consumption(self) -> np.ndarray:
@@ -535,42 +548,7 @@ class CityLearnEnv(Environment, Env):
         """Summed `Building.solar_generation, in [kWh]`."""
 
         return pd.DataFrame([b.solar_generation for b in self.buildings]).sum(axis=0, min_count=1).to_numpy()
-    
-    def calculate_energy_sharing(self):
-        # Step 1: Identify surplus and deficit buildings
-        surplus_buildings = [b for b in self.buildings if b.max_shared_energy > 0]
-        deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
-        if not surplus_buildings or not deficit_buildings:
-            return 0, {b.uid: 0 for b in self.buildings}, deficit_buildings
 
-        # Step 2: Prepare tracking variables
-        shared_energy_by_building = {b.uid: 0 for b in self.buildings}
-        total_shared_energy = 0.0
-
-        # Step 3: Sort deficit buildings by electricity price (higher prices prioritized)
-        deficit_buildings.sort(key=lambda b: -b.pricing.electricity_pricing[self.time_step])
-
-        # Step 4: Distribute energy from surplus buildings
-        for deficit_building in deficit_buildings:
-            deficit = deficit_building.net_electricity_consumption[self.time_step]
-
-            for surplus_building in surplus_buildings:
-                if deficit <= 0:
-                    break  # Move to the next deficit building
-
-                available_energy = surplus_building.max_shared_energy  # Use precomputed max shared energy
-                shared = min(deficit, available_energy)
-
-                # Update shared energy tracking
-                shared_energy_by_building[deficit_building.uid] += shared
-                total_shared_energy += shared
-
-                # Update buildings' energy states
-                surplus_building.net_electricity_consumption[self.time_step] += shared
-                deficit_building.net_electricity_consumption[self.time_step] -= shared
-
-        return total_shared_energy, shared_energy_by_building, deficit_buildings
-    
     @schema.setter
     def schema(self, schema: Union[str, Path, Mapping[str, Any]]):
         self.__schema = schema
@@ -596,6 +574,14 @@ class CityLearnEnv(Environment, Env):
     def simulation_end_time_step(self, simulation_end_time_step: int):
         assert simulation_end_time_step >= 0, 'simulation_end_time_step must be >= 0'
         self.__simulation_end_time_step = simulation_end_time_step
+
+    @min_reserved_power.setter
+    def min_reserved_power(self, min_reserved_power: float):
+        if min_reserved_power is None:
+            min_reserved_power = 0.0  # Ensure it's always a valid float
+        assert min_reserved_power >= 0, 'min_reserved_power must be >= 0'
+        self.__min_reserved_power = min_reserved_power
+
 
     @reward_function.setter
     def reward_function(self, reward_function: 'citylearn.reward_function.RewardFunction'):
@@ -665,16 +651,9 @@ class CityLearnEnv(Environment, Env):
 
         for building, building_actions in zip(self.buildings, actions):
             building.apply_actions(**building_actions)
-        # 🔹 Perform energy sharing after applying actions
-        total_shared_energy, shared_energy_by_building, deficit_buildings = self.calculate_energy_sharing()
-
-        # 🔹 Log shared energy information
-        LOGGER.info(f"Total Shared Energy: {total_shared_energy} kWh")
-        LOGGER.info(f"Shared Energy per Building: {shared_energy_by_building}")
-        LOGGER.info(f"Deficit Buildings: {[b.uid for b in deficit_buildings]}")
 
         self.next_time_step()
-        reward = self.reward_function.calculate(self.observations) 
+        reward = self.reward_function.calculate()
         self.__rewards.append(reward)
         return self.observations, reward, self.done, self.get_info()
 
@@ -949,6 +928,8 @@ class CityLearnEnv(Environment, Env):
         # variable reset
         self.__rewards = [[]]
         self.__net_electricity_consumption = []
+        self.__secondary_storage = []
+        self.__cumulative_secondary_storage = 0.0
         self.__net_electricity_consumption_cost = []
         self.__net_electricity_consumption_emission = []
         self.update_variables()
@@ -959,6 +940,11 @@ class CityLearnEnv(Environment, Env):
         # net electricity consumption
         self.__net_electricity_consumption.append(
             sum([b.net_electricity_consumption[self.time_step] for b in self.buildings]))
+        
+        #shared energy
+        current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
+        self.__cumulative_secondary_storage += current_total_surplus
+        self.__secondary_storage.append(self.__cumulative_secondary_storage)
 
         # net electriciy consumption cost
         self.__net_electricity_consumption_cost.append(
@@ -1032,6 +1018,7 @@ class CityLearnEnv(Environment, Env):
             'root_directory']
         central_agent = kwargs['central_agent'] if kwargs.get('central_agent') is not None else self.schema[
             'central_agent']
+        min_reserved_power = self.schema['min_reserved_power']
         building_observations = self.schema['observations']["buildings"]
         building_actions = self.schema['actions']["buildings"]
         chargers_observations = self.schema['observations']["ev_chargers"]
@@ -1147,6 +1134,7 @@ class CityLearnEnv(Environment, Env):
                 image_path=image_path,
                 reward_type = reward_type,
                 seconds_per_time_step=seconds_per_time_step,
+                min_reserved_power=min_reserved_power,
                 **dynamics,
             )
 
@@ -1322,7 +1310,7 @@ class CityLearnEnv(Environment, Env):
             reward_function_constructor = getattr(importlib.import_module(reward_function_module), reward_function_name)
             reward_function = reward_function_constructor(self, **reward_function_attributes)
 
-        return root_directory, buildings, evs, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, shared_observations
+        return root_directory, buildings, evs, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, min_reserved_power, shared_observations
 
     def random_location(self, lat, lon, radius, az=None):
         """
