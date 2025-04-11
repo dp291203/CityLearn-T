@@ -839,6 +839,7 @@ class Building(Environment):
                 self.energy_simulation.indoor_dry_bulb_temperature_set_point[self.time_step]),
             'occupant_count': self.energy_simulation.occupant_count[self.time_step],
             'surplus': self.__surplus[self.time_step],
+            'shared_energy': self.__shared_energy[self.time_step],
         }
 
         if include_all:

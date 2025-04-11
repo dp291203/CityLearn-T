@@ -549,6 +549,10 @@ class CityLearnEnv(Environment, Env):
 
         return pd.DataFrame([b.solar_generation for b in self.buildings]).sum(axis=0, min_count=1).to_numpy()
 
+    @property
+    def energy_distribution(self) -> List[float]:
+        return self.__energy_distribution
+
     @schema.setter
     def schema(self, schema: Union[str, Path, Mapping[str, Any]]):
         self.__schema = schema
@@ -616,6 +620,7 @@ class CityLearnEnv(Environment, Env):
             'direct_solar_irradiance_predicted_12h', 'direct_solar_irradiance_predicted_24h',
             'carbon_intensity',
         ]
+    
 
     def step(self, actions: List[List[float]]) -> Tuple[List[List[float]], List[float], bool, dict]:
         """Apply actions to `buildings` and advance to next time step.
@@ -651,6 +656,16 @@ class CityLearnEnv(Environment, Env):
 
         for building, building_actions in zip(self.buildings, actions):
             building.apply_actions(**building_actions)
+
+        #shared energy
+        current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
+        self.__cumulative_secondary_storage += current_total_surplus
+
+        #distribution from secondary storage 
+        self.__energy_distribution = self.distribute_from_secondary_storage()
+
+        #secondary storage update 
+        self.__secondary_storage.append(self.__cumulative_secondary_storage)
 
         self.next_time_step()
         reward = self.reward_function.calculate()
@@ -871,6 +886,56 @@ class CityLearnEnv(Environment, Env):
 
         return cost_functions
 
+    # def distribute_from_secondary_storage(self):
+    #     """Distribute energy from secondary storage to deficit buildings."""
+    #     deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
+    #     energy_distribution = [0.0 for _ in self.buildings]
+
+    #     if not deficit_buildings or self.__cumulative_secondary_storage <= 0:
+    #         return energy_distribution
+
+    #     amount_per_building = self.__cumulative_secondary_storage / len(deficit_buildings)
+
+    #     for building in deficit_buildings:
+    #         building_index = self.buildings.index(building)
+    #         max_possible = building.net_electricity_consumption[self.time_step]
+    #         distributed_amount = min(amount_per_building, max_possible)
+
+    #         building.net_electricity_consumption[self.time_step] -= distributed_amount
+    #         self.__cumulative_secondary_storage -= distributed_amount
+    #         energy_distribution[building_index] += distributed_amount
+
+    #         if self.__cumulative_secondary_storage <= 0:
+    #             break
+
+    #     return energy_distribution
+
+    def distribute_from_secondary_storage(self):
+        """Distribute negative surplus energy from secondary storage to deficit buildings (positive load)."""
+        deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
+        energy_distribution = [0.0 for _ in self.buildings]
+
+        if not deficit_buildings or self.__cumulative_secondary_storage >= 0:
+            return energy_distribution
+
+        total_available = -self.__cumulative_secondary_storage  # convert to positive for logic
+        amount_per_building = total_available / len(deficit_buildings)
+
+        for building in deficit_buildings:
+            building_index = self.buildings.index(building)
+            max_possible = building.net_electricity_consumption[self.time_step]
+
+            # Distribute negative energy (still passing negative value)
+            distributed_amount = -min(amount_per_building, max_possible)
+            building.net_electricity_consumption[self.time_step] += distributed_amount  # distributed_amount is negative
+            self.__cumulative_secondary_storage -= distributed_amount  # subtract negative = add energy
+            energy_distribution[building_index] += distributed_amount
+
+            if self.__cumulative_secondary_storage >= 0:
+                break
+
+        return energy_distribution
+
     def next_time_step(self):
         r"""Advance the env to next `time_step`."""
 
@@ -930,26 +995,23 @@ class CityLearnEnv(Environment, Env):
         self.__net_electricity_consumption = []
         self.__secondary_storage = []
         self.__cumulative_secondary_storage = 0.0
+        self.__energy_distribution = []
         self.__net_electricity_consumption_cost = []
         self.__net_electricity_consumption_emission = []
         self.update_variables()
 
-        return self.observations
+        return self.observations         
 
     def update_variables(self):
+        
         # net electricity consumption
         self.__net_electricity_consumption.append(
             sum([b.net_electricity_consumption[self.time_step] for b in self.buildings]))
         
-        #shared energy
-        current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
-        self.__cumulative_secondary_storage += current_total_surplus
-        self.__secondary_storage.append(self.__cumulative_secondary_storage)
-
         # net electriciy consumption cost
         self.__net_electricity_consumption_cost.append(
             sum([b.net_electricity_consumption_cost[self.time_step] for b in self.buildings]))
-
+        
         # net electriciy consumption emission
         self.__net_electricity_consumption_emission.append(
             sum([b.net_electricity_consumption_emission[self.time_step] for b in self.buildings]))
