@@ -910,31 +910,78 @@ class CityLearnEnv(Environment, Env):
 
     #     return energy_distribution
 
+    # def distribute_from_secondary_storage(self):
+    #     """Distribute negative surplus energy from secondary storage to deficit buildings (positive load)."""
+    #     deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
+    #     energy_distribution = [0.0 for _ in self.buildings]
+
+    #     if not deficit_buildings or self.__cumulative_secondary_storage >= 0:
+    #         return energy_distribution
+
+    #     total_available = -self.__cumulative_secondary_storage  # convert to positive for logic
+    #     amount_per_building = total_available / len(deficit_buildings)
+
+    #     for building in deficit_buildings:
+    #         building_index = self.buildings.index(building)
+    #         max_possible = building.net_electricity_consumption[self.time_step]
+
+    #         # Distribute negative energy (still passing negative value)
+    #         distributed_amount = -min(amount_per_building, max_possible)
+    #         building.net_electricity_consumption[self.time_step] += distributed_amount  # distributed_amount is negative
+    #         self.__cumulative_secondary_storage -= distributed_amount  # subtract negative = add energy
+    #         energy_distribution[building_index] += distributed_amount
+
+    #         if self.__cumulative_secondary_storage >= 0:
+    #             break
+
+    #     return energy_distribution
+
     def distribute_from_secondary_storage(self):
-        """Distribute negative surplus energy from secondary storage to deficit buildings (positive load)."""
+        """Distribute negative surplus energy from secondary storage to deficit buildings fairly."""
         deficit_buildings = [b for b in self.buildings if b.net_electricity_consumption[self.time_step] > 0]
         energy_distribution = [0.0 for _ in self.buildings]
 
         if not deficit_buildings or self.__cumulative_secondary_storage >= 0:
             return energy_distribution
 
-        total_available = -self.__cumulative_secondary_storage  # convert to positive for logic
-        amount_per_building = total_available / len(deficit_buildings)
+        total_available = -self.__cumulative_secondary_storage  # positive surplus energy available
 
-        for building in deficit_buildings:
-            building_index = self.buildings.index(building)
-            max_possible = building.net_electricity_consumption[self.time_step]
+        while total_available > 0 and deficit_buildings:
+            # Update deficits in case they changed
+            deficits = [b.net_electricity_consumption[self.time_step] for b in deficit_buildings]
+            min_deficit = min(deficits)
 
-            # Distribute negative energy (still passing negative value)
-            distributed_amount = -min(amount_per_building, max_possible)
-            building.net_electricity_consumption[self.time_step] += distributed_amount  # distributed_amount is negative
-            self.__cumulative_secondary_storage -= distributed_amount  # subtract negative = add energy
-            energy_distribution[building_index] += distributed_amount
+            # Prevent stuck if min_deficit is 0 or no progress can be made
+            if min_deficit <= 0:
+                break
 
+            amount_to_give = min(min_deficit, total_available / len(deficit_buildings))
+
+            # Again, if amount_to_give is 0 (e.g., very tiny surplus left), break
+            if amount_to_give <= 0:
+                break
+
+            for building in list(deficit_buildings):  # safe copy
+                building_index = self.buildings.index(building)
+                max_possible = building.net_electricity_consumption[self.time_step]
+
+                distribute = min(amount_to_give, max_possible)
+                distributed_amount = -distribute  # energy to distribute is negative
+
+                building.net_electricity_consumption[self.time_step] += distributed_amount
+                self.__cumulative_secondary_storage -= distributed_amount
+                total_available += distributed_amount  # distributed_amount is negative, so + here
+                energy_distribution[building_index] += distributed_amount
+
+            # Remove buildings that are now fulfilled
+            deficit_buildings = [b for b in deficit_buildings if b.net_electricity_consumption[self.time_step] > 0]
+
+            # Safety check
             if self.__cumulative_secondary_storage >= 0:
                 break
 
         return energy_distribution
+
 
     def next_time_step(self):
         r"""Advance the env to next `time_step`."""
