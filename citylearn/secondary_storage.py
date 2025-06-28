@@ -108,11 +108,6 @@ class SecondaryStorage(Environment):
         self.__charge[self.time_step] = actual_charge * 3600 / self.seconds_per_time_step  # Convert to kW
         self.__soc[self.time_step] += actual_charge * self.efficiency
         
-        # Distribute the charging across buildings proportionally
-        if total_surplus > 0:
-            for building in buildings:
-                share = building.shared_energy[self.time_step] / total_surplus
-                building.shared_energy[self.time_step] -= share * actual_charge
 
     def discharge_to_buildings(self, buildings: List['Building']):
         """Discharge storage to deficit buildings.
