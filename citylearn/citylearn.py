@@ -21,6 +21,7 @@ import time
 import os
 import folium
 import random
+from citylearn.secondary_storage import SecondaryStorage
 
 LOGGER = logging.getLogger()
 logging.getLogger('matplotlib.font_manager').disabled = True
@@ -80,12 +81,13 @@ class CityLearnEnv(Environment, Env):
                  evs: Union[List[electric_vehicle], List[str], List[int]] = None, simulation_start_time_step: int = None,
                  simulation_end_time_step: int = None,
                  reward_function: 'citylearn.reward_function.RewardFunction' = None, central_agent: bool = None, min_reserved_power: float = None,
-                 shared_observations: List[str] = None, **kwargs: Any
+                 shared_observations: List[str] = None, 
+                 secondary_storage: SecondaryStorage = None, **kwargs: Any
                  ):
         self.schema = schema
         self.__rewards = None
         self.root_directory, self.buildings, self.evs, self.simulation_start_time_step, self.simulation_end_time_step, self.seconds_per_time_step, \
-            self.reward_function, self.central_agent,self.min_reserved_power, self.shared_observations = self._load(
+            self.reward_function, self.central_agent,self.min_reserved_power, self.shared_observations, self.secondary_storage = self._load(
             root_directory=root_directory,
             buildings=buildings,
             evs=evs,
@@ -96,6 +98,7 @@ class CityLearnEnv(Environment, Env):
             min_reserved_power=min_reserved_power,
             shared_observations=shared_observations,
         )
+        self.secondary_storage = secondary_storage
         super().__init__(**kwargs)
 
     @property
@@ -661,12 +664,31 @@ class CityLearnEnv(Environment, Env):
         current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
         self.__cumulative_secondary_storage += current_total_surplus
 
-        #distribution from secondary storage 
-        self.__energy_distribution = self.distribute_from_secondary_storage()
+        # #distribution from secondary storage 
+        # self.__energy_distribution = self.distribute_from_secondary_storage()
 
-        #secondary storage update 
-        self.__secondary_storage.append(self.__cumulative_secondary_storage)
+        # #secondary storage update 
+        # self.__secondary_storage.append(self.__cumulative_secondary_storage)
 
+        if self.secondary_storage:
+            storage_actions = actions[-1] if self.central_agent else [b_actions[-1] for b_actions in actions]
+            building_actions = actions[:-1] if self.central_agent else [b_actions[:-1] for b_actions in actions]
+        else:
+            building_actions = actions
+            
+        # Existing building actions
+        actions = self.__parse_actions(building_actions)
+        for building, building_actions in zip(self.buildings, actions):
+            building.apply_actions(**building_actions)
+            
+        # Secondary storage actions
+        if self.secondary_storage:
+            # Charge from building surpluses
+            self.secondary_storage.charge_from_buildings(self.buildings)
+            
+            # Discharge to deficit buildings
+            self.secondary_storage.discharge_to_buildings(self.buildings)
+        
         self.next_time_step()
         reward = self.reward_function.calculate()
         self.__rewards.append(reward)
@@ -1419,7 +1441,19 @@ class CityLearnEnv(Environment, Env):
             reward_function_constructor = getattr(importlib.import_module(reward_function_module), reward_function_name)
             reward_function = reward_function_constructor(self, **reward_function_attributes)
 
-        return root_directory, buildings, evs, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, min_reserved_power, shared_observations
+        if self.schema.get('secondary_storage'):
+            storage_schema = self.schema['secondary_storage']
+            storage_type = storage_schema['type']
+            storage_module = '.'.join(storage_type.split('.')[0:-1])
+            storage_name = storage_type.split('.')[-1]
+            storage_constructor = getattr(importlib.import_module(storage_module), storage_name)
+            storage_attributes = storage_schema.get('attributes', {})
+            storage_attributes['seconds_per_time_step'] = seconds_per_time_step
+            secondary_storage = storage_constructor(**storage_attributes)
+        else:
+            secondary_storage = None
+
+        return root_directory, buildings, evs, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, min_reserved_power, shared_observations, secondary_storage
 
     def random_location(self, lat, lon, radius, az=None):
         """
