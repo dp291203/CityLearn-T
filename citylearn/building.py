@@ -840,6 +840,8 @@ class Building(Environment):
             'occupant_count': self.energy_simulation.occupant_count[self.time_step],
             'surplus': self.__surplus[self.time_step],
             'shared_energy': self.__shared_energy[self.time_step],
+            'secondary_storage_soc': 0.5,  # Default value, will be updated by environment
+            'secondary_storage_energy_balance': 0.0,  # Default value, will be updated by environment
         }
 
         if include_all:
@@ -954,6 +956,8 @@ class Building(Environment):
         ev_storage_action : List[float], default: 0.0
             List in which each action corresponds to the order of chargers oer building and is a fraction of
             connected_ev in each charger that the battery `capacity` to charge/discharge by.
+        secondary_storage_action : float, default: 0.0
+            Fraction representing request to charge/discharge secondary storage (-1 to 1).
         """
 
         cooling_storage_action = 0.0 if cooling_storage_action is None or math.isnan(
@@ -963,11 +967,17 @@ class Building(Environment):
         dhw_storage_action = 0.0 if dhw_storage_action is None or math.isnan(dhw_storage_action) else dhw_storage_action
         electrical_storage_action = 0.0 if electrical_storage_action is None or math.isnan(
             electrical_storage_action) else electrical_storage_action
+        secondary_storage_action = kwargs.get('secondary_storage_action', 0.0)
+        secondary_storage_action = 0.0 if secondary_storage_action is None or math.isnan(
+            secondary_storage_action) else secondary_storage_action
 
         self.update_cooling(cooling_device_action, cooling_storage_action)
         self.update_heating(heating_device_action, heating_storage_action)
         self.update_dhw(dhw_storage_action)
         self.update_electrical_storage(electrical_storage_action)
+        
+        # Store secondary storage request for environment to process
+        self.secondary_storage_request = secondary_storage_action
 
         if self.chargers is not None:
             for key, action_value in kwargs.items():
@@ -1148,7 +1158,7 @@ class Building(Environment):
         Lower and upper bounds of net electricity consumption are rough estimates and may not be completely accurate hence,
         scaling this observation-variable using these bounds may result in normalized values above 1 or below 0.
         """
-
+        
         include_all = False if include_all is None else include_all
         observation_names = list(self.observation_metadata.keys()) if include_all else self.active_observations
         periodic_normalization = False if periodic_normalization is None else periodic_normalization
@@ -1160,6 +1170,8 @@ class Building(Environment):
             **vars(self.weather),
             **vars(self.carbon_intensity),
             **vars(self.pricing),
+            'secondary_storage_soc': np.array([0.5] * len(self.energy_simulation.hour)),  # Default values
+            'secondary_storage_energy_balance': np.array([0.0] * len(self.energy_simulation.hour)),  # Default values
         }
 
         for key in observation_names:
@@ -1181,9 +1193,13 @@ class Building(Environment):
                 low_limit[key] = 0
                 high_limit[key] = 168 #7days
 
-            elif key in ["required_soc_departure", "estimated_soc_arrival", "ev_state", "ev_soc", 'cooling_storage_soc', 'heating_storage_soc', 'dhw_storage_soc', 'electrical_storage_soc']:
+            elif key in ["required_soc_departure", "estimated_soc_arrival", "ev_state", "ev_soc", 'cooling_storage_soc', 'heating_storage_soc', 'dhw_storage_soc', 'electrical_storage_soc', 'secondary_storage_soc']:
                 low_limit[key] = 0.0
                 high_limit[key] = 1.0
+
+            elif key == 'secondary_storage_energy_balance':
+                low_limit[key] = -100.0  # Reasonable range for energy balance
+                high_limit[key] = 100.0
 
             elif key in ['cooling_device_cop']:
                 cop = self.cooling_device.get_cop(self.weather.outdoor_dry_bulb_temperature, heating=False)
@@ -1261,10 +1277,11 @@ class Building(Environment):
 
         Notes
         -----
-        The lower and upper bounds for the `cooling_storage`, `heating_storage` and `dhw_storage` actions are set to (+/-) 1/maximum_demand for each respective end use, 
-        as the energy storage device can't provide the building with more energy than it will ever need for a given time step. . 
+        The lower and upper bounds for the `cooling_storage`, `heating_storage` and `dhw_storage` actions are set to (+/-) 1/maximum_demand for each respective end use,
+        as the energy storage device can't provide the building with more energy than it will ever need for a given time step.
         For example, if `cooling_storage` capacity is 20 kWh and the maximum `cooling_demand` is 5 kWh, its actions will be bounded between -5/20 and 5/20.
-        These boundaries should speed up the learning process of the agents and make them more stable compared to setting them to -1 and 1. 
+        These boundaries should speed up the learning process of the agents and make them more stable compared to setting them to -1 and 1.
+
         """
 
         low_limit, high_limit = [], []
@@ -1298,6 +1315,12 @@ class Building(Environment):
                 elif key == 'dhw_storage':
                     capacity = self.dhw_storage.capacity
                     maximum_demand = self.energy_simulation.dhw_demand.max()
+
+                elif key == 'secondary_storage':
+                    # Secondary storage action is a request fraction (-1 to 1)
+                    low_limit.append(-1.0)
+                    high_limit.append(1.0)
+                    continue
 
                 else:
                     raise Exception(f'Unknown action: {key}')

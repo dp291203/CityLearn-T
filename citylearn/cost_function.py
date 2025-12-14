@@ -273,3 +273,194 @@ class CostFunction:
             data['discomfort_delta_average'].tolist()
         )
         
+    @staticmethod
+    def secondary_storage_efficiency(secondary_storage_energy_balance: List[float], 
+                                   net_electricity_consumption: List[float]) -> float:
+        """Calculate secondary storage efficiency in reducing grid interaction.
+        
+        Parameters
+        ----------
+        secondary_storage_energy_balance : List[float]
+            Secondary storage energy balance time series.
+        net_electricity_consumption : List[float]
+            Net electricity consumption time series.
+            
+        Returns
+        -------
+        efficiency : float
+            Secondary storage efficiency ratio (0-1).
+        """
+        if not secondary_storage_energy_balance or not net_electricity_consumption:
+            return 0.0
+            
+        total_storage_energy = sum(abs(x) for x in secondary_storage_energy_balance)
+        total_consumption = sum(abs(x) for x in net_electricity_consumption)
+        
+        if total_consumption == 0:
+            return 0.0
+            
+        return min(total_storage_energy / total_consumption, 1.0)
+    
+    @staticmethod
+    def energy_sharing_ratio(secondary_storage_energy_balance: List[float],
+                           building_surpluses: List[List[float]]) -> float:
+        """Calculate the ratio of energy successfully shared through secondary storage.
+        
+        Parameters
+        ----------
+        secondary_storage_energy_balance : List[float]
+            Secondary storage energy balance time series.
+        building_surpluses : List[List[float]]
+            Surplus energy for each building over time.
+            
+        Returns
+        -------
+        sharing_ratio : float
+            Ratio of energy shared vs total surplus (0-1).
+        """
+        if not secondary_storage_energy_balance or not building_surpluses:
+            return 0.0
+            
+        total_shared = sum(abs(x) for x in secondary_storage_energy_balance)
+        total_surplus = sum(sum(abs(x) for x in building if x < 0) 
+                          for building in building_surpluses)
+        
+        if total_surplus == 0:
+            return 0.0
+            
+        return min(total_shared / total_surplus, 1.0)
+    
+    @staticmethod
+    def secondary_storage_utilization(secondary_storage_soc: List[float]) -> dict:
+        """Calculate secondary storage utilization metrics.
+        
+        Parameters
+        ----------
+        secondary_storage_soc : List[float]
+            Secondary storage state of charge time series.
+            
+        Returns
+        -------
+        utilization_metrics : dict
+            Dictionary containing utilization metrics.
+        """
+        if not secondary_storage_soc:
+            return {
+                'average_soc': 0.0,
+                'soc_variance': 0.0,
+                'utilization_rate': 0.0,
+                'cycling_frequency': 0.0
+            }
+        
+        data = pd.DataFrame({'soc': secondary_storage_soc})
+        
+        # Calculate metrics
+        average_soc = data['soc'].mean()
+        soc_variance = data['soc'].var()
+        
+        # Utilization rate: how much of the capacity range is used
+        soc_range = data['soc'].max() - data['soc'].min()
+        utilization_rate = soc_range
+        
+        # Cycling frequency: number of charge/discharge cycles
+        soc_diff = data['soc'].diff().fillna(0)
+        direction_changes = (soc_diff * soc_diff.shift(1) < 0).sum()
+        cycling_frequency = direction_changes / len(data) if len(data) > 0 else 0.0
+        
+        return {
+            'average_soc': average_soc,
+            'soc_variance': soc_variance,
+            'utilization_rate': utilization_rate,
+            'cycling_frequency': cycling_frequency
+        }
+    
+    @staticmethod
+    def grid_interaction_reduction(net_consumption_with_storage: List[float],
+                                 net_consumption_without_storage: List[float]) -> float:
+        """Calculate grid interaction reduction due to secondary storage.
+        
+        Parameters
+        ----------
+        net_consumption_with_storage : List[float]
+            Net electricity consumption with secondary storage.
+        net_consumption_without_storage : List[float]
+            Net electricity consumption without secondary storage.
+            
+        Returns
+        -------
+        reduction_ratio : float
+            Grid interaction reduction ratio (0-1).
+        """
+        if not net_consumption_with_storage or not net_consumption_without_storage:
+            return 0.0
+            
+        total_with = sum(abs(x) for x in net_consumption_with_storage)
+        total_without = sum(abs(x) for x in net_consumption_without_storage)
+        
+        if total_without == 0:
+            return 0.0
+            
+        reduction = max(0, total_without - total_with)
+        return reduction / total_without
+    
+    @staticmethod
+    def secondary_storage_kpis(secondary_storage_soc: List[float],
+                             secondary_storage_energy_balance: List[float],
+                             net_electricity_consumption: List[float],
+                             building_surpluses: List[List[float]] = None) -> dict:
+        """Calculate comprehensive secondary storage KPIs.
+        
+        Parameters
+        ----------
+        secondary_storage_soc : List[float]
+            Secondary storage state of charge time series.
+        secondary_storage_energy_balance : List[float]
+            Secondary storage energy balance time series.
+        net_electricity_consumption : List[float]
+            Net electricity consumption time series.
+        building_surpluses : List[List[float]], optional
+            Surplus energy for each building over time.
+            
+        Returns
+        -------
+        kpis : dict
+            Comprehensive KPI dictionary.
+        """
+        kpis = {}
+        
+        # Basic utilization metrics
+        utilization_metrics = CostFunction.secondary_storage_utilization(secondary_storage_soc)
+        kpis.update(utilization_metrics)
+        
+        # Efficiency metrics
+        kpis['storage_efficiency'] = CostFunction.secondary_storage_efficiency(
+            secondary_storage_energy_balance, net_electricity_consumption
+        )
+        
+        # Energy sharing metrics
+        if building_surpluses:
+            kpis['energy_sharing_ratio'] = CostFunction.energy_sharing_ratio(
+                secondary_storage_energy_balance, building_surpluses
+            )
+        
+        # Energy flow metrics
+        if secondary_storage_energy_balance:
+            total_energy_flow = sum(abs(x) for x in secondary_storage_energy_balance)
+            charging_energy = sum(x for x in secondary_storage_energy_balance if x > 0)
+            discharging_energy = sum(abs(x) for x in secondary_storage_energy_balance if x < 0)
+            
+            kpis['total_energy_flow'] = total_energy_flow
+            kpis['charging_energy'] = charging_energy
+            kpis['discharging_energy'] = discharging_energy
+            kpis['charge_discharge_ratio'] = (charging_energy / discharging_energy 
+                                            if discharging_energy > 0 else 0.0)
+        
+        # Performance indicators
+        if net_electricity_consumption:
+            peak_consumption = max(abs(x) for x in net_electricity_consumption)
+            average_consumption = np.mean([abs(x) for x in net_electricity_consumption])
+            kpis['peak_consumption'] = peak_consumption
+            kpis['average_consumption'] = average_consumption
+            kpis['peak_to_average_ratio'] = peak_consumption / average_consumption if average_consumption > 0 else 0.0
+        
+        return kpis

@@ -1,7 +1,9 @@
-from typing import List, Tuple
+from typing import List, Tuple, TYPE_CHECKING
 import numpy as np
-from citylearn.citylearn import CityLearnEnv
 from citylearn.energy_model import ZERO_DIVISION_CAPACITY
+
+if TYPE_CHECKING:
+    from citylearn.citylearn import CityLearnEnv
 from math import sqrt
 
 
@@ -23,18 +25,18 @@ class RewardFunction:
     where :math:`e` is `electricity_consumption` and :math:`n` is the number of agents.
     """
 
-    def __init__(self, env: CityLearnEnv, **kwargs):
+    def __init__(self, env, **kwargs):
         self.env = env
         self.kwargs = kwargs
 
     @property
-    def env(self) -> CityLearnEnv:
+    def env(self):
         """Simulation environment."""
 
         return self.__env
 
     @env.setter
-    def env(self, env: CityLearnEnv):
+    def env(self, env):
         self.__env = env
 
     def calculate(self) -> List[float]:
@@ -68,7 +70,7 @@ class MARL(RewardFunction):
     where :math:`e` is the building `electricity_consumption` and :math:`E` is the district `electricity_consumption`.
     """
 
-    def __init__(self, env: CityLearnEnv):
+    def __init__(self, env):
         super().__init__(env)
 
     def calculate(self) -> List[float]:
@@ -103,7 +105,7 @@ class IndependentSACReward(RewardFunction):
     where :math:`e` is `electricity_consumption` and :math:`n` is the number of agents.
     """
 
-    def __init__(self, env: CityLearnEnv):
+    def __init__(self, env):
         super().__init__(env)
 
     def calculate(self) -> List[float]:
@@ -133,7 +135,7 @@ class SolarPenaltyReward(RewardFunction):
         CityLearn environment.
     """
 
-    def __init__(self, env: CityLearnEnv):
+    def __init__(self, env):
         super().__init__(env)
 
     def calculate(self) -> List[float]:
@@ -207,7 +209,7 @@ class V2GPenaltyReward(RewardFunction):
         CityLearn environment.
     """
 
-    def __init__(self, env: CityLearnEnv,
+    def __init__(self, env,
                  peak_percentage_threshold=0.10,
                  ramping_percentage_threshold=0.10,
                  peak_penalty_weight=20,
@@ -441,7 +443,7 @@ class ComfortReward(RewardFunction):
         boundary or heating mode but temperature is above setpoint upper boundary.
     """
 
-    def __init__(self, env: CityLearnEnv, band: float = None, lower_exponent: float = None,
+    def __init__(self, env, band: float = None, lower_exponent: float = None,
                  higher_exponent: float = None):
         super().__init__(env)
         self.band = band
@@ -527,7 +529,7 @@ class SolarPenaltyAndComfortReward(RewardFunction):
         Coefficents for `citylearn.reward_function.SolarPenaltyReward` and :py:class:`citylearn.reward_function.ComfortReward` values respectively.
     """
 
-    def __init__(self, env: CityLearnEnv, band: float = None, lower_exponent: float = None,
+    def __init__(self, env, band: float = None, lower_exponent: float = None,
                  higher_exponent: float = None, coefficients: Tuple = None):
         super().__init__(env)
         self.__functions: List[RewardFunction] = [
@@ -553,3 +555,132 @@ class SolarPenaltyAndComfortReward(RewardFunction):
         reward = reward.sum(axis=0).tolist()
 
         return reward
+
+
+class SecondaryStorageReward(RewardFunction):
+    """
+    Reward function that incentivizes optimal secondary storage usage.
+    
+    The reward function encourages:
+    1. Charging secondary storage when buildings have surplus energy
+    2. Discharging secondary storage when buildings have deficit energy
+    3. Minimizing grid interaction through effective energy sharing
+    4. Maintaining reasonable secondary storage SOC levels
+    """
+    
+    def __init__(self, env, **kwargs):
+        """
+        Initialize SecondaryStorageReward.
+        
+        Parameters
+        ----------
+        env : CityLearnEnv
+            CityLearn environment.
+        **kwargs : dict
+            Other keyword arguments including reward weights.
+        """
+        super().__init__(env, **kwargs)
+        
+        # Reward weights
+        self.electricity_consumption_weight = kwargs.get('electricity_consumption_weight', 1.0)
+        self.secondary_storage_weight = kwargs.get('secondary_storage_weight', 0.5)
+        self.energy_sharing_weight = kwargs.get('energy_sharing_weight', 0.3)
+        self.grid_interaction_weight = kwargs.get('grid_interaction_weight', 0.2)
+        
+        # Tracking variables
+        self.previous_secondary_storage_soc = None
+        
+    def calculate(self) -> List[float]:
+        """
+        Calculate reward for each building based on secondary storage usage.
+        
+        Returns
+        -------
+        reward : List[float]
+            Reward for each building.
+        """
+        
+        rewards = []
+        
+        # Get secondary storage information
+        secondary_storage_soc = 0.0
+        secondary_storage_energy_balance = 0.0
+        
+        if hasattr(self.env, 'secondary_storage') and self.env.secondary_storage is not None:
+            secondary_storage_soc = self.env.secondary_storage.soc
+            if len(self.env.secondary_storage.energy_balance) > 0:
+                secondary_storage_energy_balance = self.env.secondary_storage.energy_balance[-1]
+        
+        # Calculate total community metrics
+        total_net_consumption = sum([b.net_electricity_consumption[self.env.time_step] for b in self.env.buildings])
+        
+        for i, building in enumerate(self.env.buildings):
+            reward = 0.0
+            
+            # Get building metrics
+            net_consumption = building.net_electricity_consumption[self.env.time_step]
+            solar_generation = abs(building.solar_generation[self.env.time_step])
+            secondary_storage_request = getattr(building, 'secondary_storage_request', 0.0)
+            
+            # 1. Basic electricity consumption penalty
+            electricity_penalty = -abs(net_consumption) * self.electricity_consumption_weight
+            reward += electricity_penalty
+            
+            # 2. Secondary storage usage reward
+            if hasattr(self.env, 'secondary_storage') and self.env.secondary_storage is not None:
+                
+                # Reward appropriate secondary storage requests
+                if net_consumption < 0:  # Building has surplus (negative consumption)
+                    # Reward charging secondary storage when surplus
+                    if secondary_storage_request > 0:
+                        surplus_reward = abs(net_consumption) * secondary_storage_request * self.secondary_storage_weight
+                        reward += surplus_reward
+                    # Penalize discharging when surplus
+                    elif secondary_storage_request < 0:
+                        surplus_penalty = abs(net_consumption) * abs(secondary_storage_request) * self.secondary_storage_weight * 0.5
+                        reward -= surplus_penalty
+                        
+                elif net_consumption > 0:  # Building has deficit (positive consumption)
+                    # Reward discharging secondary storage when deficit
+                    if secondary_storage_request < 0:
+                        deficit_reward = net_consumption * abs(secondary_storage_request) * self.secondary_storage_weight
+                        reward += deficit_reward
+                    # Penalize charging when deficit
+                    elif secondary_storage_request > 0:
+                        deficit_penalty = net_consumption * secondary_storage_request * self.secondary_storage_weight * 0.5
+                        reward -= deficit_penalty
+                
+                # 3. Energy sharing effectiveness reward
+                if abs(secondary_storage_energy_balance) > 0:
+                    # Reward when secondary storage is actively used for energy sharing
+                    sharing_reward = min(abs(secondary_storage_energy_balance), abs(net_consumption)) * self.energy_sharing_weight
+                    reward += sharing_reward
+                
+                # 4. Grid interaction minimization
+                # Reward reducing grid dependency through energy sharing
+                if total_net_consumption != 0:
+                    grid_reduction = abs(secondary_storage_energy_balance) / max(abs(total_net_consumption), 1.0)
+                    grid_reward = grid_reduction * self.grid_interaction_weight
+                    reward += grid_reward
+                
+                # 5. Secondary storage SOC management
+                # Encourage maintaining reasonable SOC levels (not too high or too low)
+                if 0.2 <= secondary_storage_soc <= 0.8:
+                    soc_reward = 0.1 * self.secondary_storage_weight
+                    reward += soc_reward
+                elif secondary_storage_soc < 0.1 or secondary_storage_soc > 0.9:
+                    soc_penalty = 0.2 * self.secondary_storage_weight
+                    reward -= soc_penalty
+            
+            # 6. Solar utilization bonus
+            if solar_generation > 0 and net_consumption < 0:
+                # Bonus for effectively using solar generation
+                solar_bonus = min(solar_generation, abs(net_consumption)) * 0.1
+                reward += solar_bonus
+            
+            rewards.append(reward)
+        
+        # Store for next iteration
+        self.previous_secondary_storage_soc = secondary_storage_soc
+        
+        return rewards

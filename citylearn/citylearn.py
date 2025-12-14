@@ -11,12 +11,13 @@ from gym.core import RenderFrame
 from citylearn import __version__ as citylearn_version
 from citylearn.base import Environment
 from citylearn.building import Building
-from citylearn.electric_vehicle import electric_vehicle
-from citylearn.charger import Charger
 from citylearn.cost_function import CostFunction
 from citylearn.data import DataSet, EnergySimulation, CarbonIntensity, Pricing, Weather, EVSimulation
+from citylearn.electric_vehicle import electric_vehicle
+from citylearn.secondary_storage import SecondaryStorage
+from citylearn.preprocessing import Normalize, PeriodicNormalization
+from citylearn.reward_function import RewardFunction
 from citylearn.utilities import read_json
-from typing import Optional, Union, List
 import time
 import os
 import folium
@@ -84,7 +85,7 @@ class CityLearnEnv(Environment, Env):
                  ):
         self.schema = schema
         self.__rewards = None
-        self.root_directory, self.buildings, self.evs, self.simulation_start_time_step, self.simulation_end_time_step, self.seconds_per_time_step, \
+        self.root_directory, self.buildings, self.evs, self.secondary_storage, self.simulation_start_time_step, self.simulation_end_time_step, self.seconds_per_time_step, \
             self.reward_function, self.central_agent,self.min_reserved_power, self.shared_observations = self._load(
             root_directory=root_directory,
             buildings=buildings,
@@ -121,6 +122,12 @@ class CityLearnEnv(Environment, Env):
         """Electric Vehicles in CityLearn environment."""
 
         return self.__evs
+
+    @property
+    def secondary_storage(self) -> SecondaryStorage:
+        """Secondary storage system in CityLearn environment."""
+
+        return self.__secondary_storage
 
     @property
     def simulation_start_time_step(self) -> int:
@@ -395,10 +402,10 @@ class CityLearnEnv(Environment, Env):
         return self.__net_electricity_consumption
     
     @property 
-    def secondary_storage(self) -> List[float]:
-        """Summed 'Building.shared_energy' time series, in [kWh]."""
+    def secondary_storage_history(self) -> List[float]:
+        """Secondary storage energy history time series, in [kWh]."""
 
-        return self.__secondary_storage
+        return self.__secondary_storage_history
 
     @property
     def cooling_electricity_consumption(self) -> np.ndarray:
@@ -569,6 +576,10 @@ class CityLearnEnv(Environment, Env):
     def evs(self, evs: List[electric_vehicle]):
         self.__evs = evs
 
+    @secondary_storage.setter
+    def secondary_storage(self, secondary_storage: SecondaryStorage):
+        self.__secondary_storage = secondary_storage
+
     @simulation_start_time_step.setter
     def simulation_start_time_step(self, simulation_start_time_step: int):
         assert simulation_start_time_step >= 0, 'simulation_start_time_step must be >= 0'
@@ -657,15 +668,16 @@ class CityLearnEnv(Environment, Env):
         for building, building_actions in zip(self.buildings, actions):
             building.apply_actions(**building_actions)
 
-        #shared energy
-        current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
-        self.__cumulative_secondary_storage += current_total_surplus
-
-        #distribution from secondary storage 
-        self.__energy_distribution = self.distribute_from_secondary_storage()
-
-        #secondary storage update 
-        self.__secondary_storage.append(self.__cumulative_secondary_storage)
+        # Apply secondary storage actions if available
+        if hasattr(self, 'secondary_storage') and self.secondary_storage is not None:
+            # Handle secondary storage requests from buildings
+            self.handle_secondary_storage_requests()
+        else:
+            # Fallback to static secondary storage logic
+            current_total_surplus = sum([b.shared_energy[self.time_step] for b in self.buildings])
+            self.__cumulative_secondary_storage += current_total_surplus
+            self.__energy_distribution = self.distribute_from_secondary_storage()
+            self.__secondary_storage_history.append(self.__cumulative_secondary_storage)
 
         self.next_time_step()
         reward = self.reward_function.calculate()
@@ -700,6 +712,37 @@ class CityLearnEnv(Environment, Env):
                    enumerate(self.buildings)]
 
         return actions
+
+    def handle_secondary_storage_requests(self):
+        """Handle secondary storage requests from buildings based on their actions."""
+        if not hasattr(self, 'secondary_storage') or self.secondary_storage is None:
+            return
+            
+        # Collect all secondary storage requests from buildings
+        total_charge_request = 0.0
+        total_discharge_request = 0.0
+        building_requests = []
+        
+        for building in self.buildings:
+            # Check if building has secondary storage action
+            if hasattr(building, 'secondary_storage_request'):
+                request = getattr(building, 'secondary_storage_request', 0.0)
+                building_requests.append((building, request))
+                
+                if request > 0:
+                    total_charge_request += request
+                else:
+                    total_discharge_request += abs(request)
+        
+        # Apply secondary storage action (aggregate all requests)
+        net_request = total_charge_request - total_discharge_request
+        
+        # Apply the net request to secondary storage
+        if net_request != 0:
+            self.secondary_storage.apply_actions(secondary_storage_action=net_request)
+        else:
+            # No requests, just update with zero action
+            self.secondary_storage.apply_actions(secondary_storage_action=0.0)
 
     def get_building_information(self) -> Tuple[Mapping[str, Any]]:
         """Get buildings PV capacity, end-use annual demands, and correlations with other buildings end-use annual demands.
@@ -1040,7 +1083,7 @@ class CityLearnEnv(Environment, Env):
         # variable reset
         self.__rewards = [[]]
         self.__net_electricity_consumption = []
-        self.__secondary_storage = []
+        self.__secondary_storage_history = []
         self.__cumulative_secondary_storage = 0.0
         self.__energy_distribution = []
         self.__net_electricity_consumption_cost = []
@@ -1419,7 +1462,49 @@ class CityLearnEnv(Environment, Env):
             reward_function_constructor = getattr(importlib.import_module(reward_function_module), reward_function_name)
             reward_function = reward_function_constructor(self, **reward_function_attributes)
 
-        return root_directory, buildings, evs, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, min_reserved_power, shared_observations
+        # Initialize secondary storage if specified in schema
+        secondary_storage = None
+        if self.schema.get('secondary_storage', None) is not None:
+            secondary_storage_schema = self.schema['secondary_storage']
+            if secondary_storage_schema.get('include', True):
+                from citylearn.energy_model import Battery
+                
+                # Create battery for secondary storage
+                battery_config = secondary_storage_schema.get('battery', {})
+                battery_attributes = battery_config.get('attributes', {})
+                battery_attributes['seconds_per_time_step'] = seconds_per_time_step
+                battery = Battery(**battery_attributes)
+                
+                # Get observation and action metadata
+                ss_observation_metadata = SecondaryStorage.get_default_observation_metadata()
+                ss_action_metadata = SecondaryStorage.get_default_action_metadata()
+                
+                # Override with schema settings if provided
+                if secondary_storage_schema.get('inactive_observations', None) is not None:
+                    for obs in secondary_storage_schema['inactive_observations']:
+                        if obs in ss_observation_metadata:
+                            ss_observation_metadata[obs] = False
+                            
+                if secondary_storage_schema.get('inactive_actions', None) is not None:
+                    for action in secondary_storage_schema['inactive_actions']:
+                        if action in ss_action_metadata:
+                            ss_action_metadata[action] = False
+                
+                # Create secondary storage
+                secondary_storage = SecondaryStorage(
+                    battery=battery,
+                    observation_metadata=ss_observation_metadata,
+                    action_metadata=ss_action_metadata,
+                    name=secondary_storage_schema.get('name', 'SecondaryStorage'),
+                    seconds_per_time_step=seconds_per_time_step
+                )
+                
+                # Autosize battery if specified
+                if secondary_storage_schema.get('autosize', False):
+                    autosize_kwargs = secondary_storage_schema.get('autosize_attributes', {})
+                    secondary_storage.autosize_battery(**autosize_kwargs)
+
+        return root_directory, buildings, evs, secondary_storage, simulation_start_time_step, simulation_end_time_step, seconds_per_time_step, reward_function, central_agent, min_reserved_power, shared_observations
 
     def random_location(self, lat, lon, radius, az=None):
         """
