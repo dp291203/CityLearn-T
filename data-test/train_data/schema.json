@@ -5,6 +5,23 @@
   "simulation_end_time_step": 8759,
   "episodes": 1,
   "seconds_per_time_step": 3600,
+  "min_reserved_power": 0.20,
+  "secondary_storage": {
+    "include": true,
+    "name": "CommunityStorage",
+    "battery": {
+      "type": "citylearn.energy_model.Battery",
+      "attributes": {
+        "capacity": 200.0,
+        "nominal_power": 100.0,
+        "efficiency": 0.95,
+        "initial_soc": 0.0
+      }
+    },
+    "autosize": false,
+    "inactive_observations": [],
+    "inactive_actions": []
+  },
   "observations": {
     "buildings": {
       "month": {
@@ -146,6 +163,14 @@
       "electricity_pricing_predicted_24h": {
         "active": true,
         "shared_in_central_agent": false
+      },
+      "secondary_storage_soc": {
+        "active": true,
+        "shared_in_central_agent": true
+      },
+      "secondary_storage_energy_balance": {
+        "active": true,
+        "shared_in_central_agent": true
       }
     },
     "ev_chargers": {
@@ -188,6 +213,9 @@
       },
       "electrical_storage": {
         "active": true
+      },
+      "secondary_storage": {
+        "active": true
       }
     },
     "ev_chargers": {
@@ -216,8 +244,17 @@
     }
   },
   "reward_function": {
-    "type": "citylearn.reward_function.V2GPenaltyReward",
-    "attributes": {}
+    "type": "citylearn.reward_function.V2GSecondaryStorageReward",
+    "attributes": {
+      "ss_correct_action_weight": 5.0,
+      "ss_wrong_action_penalty": -3.0,
+      "ss_soc_health_weight": 1.5,
+      "ss_grid_reduction_weight": 4.0,
+      "ss_solar_capture_weight": 3.0,
+      "ss_pricing_weight": 2.0,
+      "ss_community_coordination_weight": 0.15,
+      "ss_reward_clip": 10.0
+    }
   },
   "evs": {
     "EV_1": {

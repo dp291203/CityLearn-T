@@ -719,30 +719,24 @@ class CityLearnEnv(Environment, Env):
             return
             
         # Collect all secondary storage requests from buildings
-        total_charge_request = 0.0
-        total_discharge_request = 0.0
-        building_requests = []
+        requests = []
         
         for building in self.buildings:
-            # Check if building has secondary storage action
             if hasattr(building, 'secondary_storage_request'):
                 request = getattr(building, 'secondary_storage_request', 0.0)
-                building_requests.append((building, request))
-                
-                if request > 0:
-                    total_charge_request += request
-                else:
-                    total_discharge_request += abs(request)
+                requests.append(request)
         
-        # Apply secondary storage action (aggregate all requests)
-        net_request = total_charge_request - total_discharge_request
-        
-        # Apply the net request to secondary storage
-        if net_request != 0:
-            self.secondary_storage.apply_actions(secondary_storage_action=net_request)
+        # Average the requests so the aggregated action stays in [-1, 1]
+        if requests:
+            avg_request = sum(requests) / len(requests)
         else:
-            # No requests, just update with zero action
-            self.secondary_storage.apply_actions(secondary_storage_action=0.0)
+            avg_request = 0.0
+        
+        # Clamp to [-1, 1] for safety
+        avg_request = max(-1.0, min(1.0, avg_request))
+        
+        # Apply the averaged request to secondary storage
+        self.secondary_storage.apply_actions(secondary_storage_action=avg_request)
 
     def get_building_information(self) -> Tuple[Mapping[str, Any]]:
         """Get buildings PV capacity, end-use annual demands, and correlations with other buildings end-use annual demands.
@@ -1033,9 +1027,13 @@ class CityLearnEnv(Environment, Env):
         for building in self.buildings:
             building.next_time_step()
 
-        # Advance buildings to the next time step
+        # Advance EVs to the next time step
         for ev in self.evs:
             ev.next_time_step()
+
+        # Advance secondary storage to the next time step
+        if hasattr(self, 'secondary_storage') and self.secondary_storage is not None:
+            self.secondary_storage.next_time_step()
 
         super().next_time_step()
 
@@ -1077,6 +1075,9 @@ class CityLearnEnv(Environment, Env):
 
         for ev in self.evs:
             ev.reset()
+
+        if hasattr(self, 'secondary_storage') and self.secondary_storage is not None:
+            self.secondary_storage.reset()
 
         self.associate_evs_2_chargers()
 

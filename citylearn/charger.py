@@ -343,6 +343,10 @@ class Charger(Environment):
         else:
             self.__electricity_consumption[self.time_step] = 0
             self.__electricity_consumption_without_partial_load[self.time_step] = 0
+            # Keep EV battery soc list in sync with time_step even when not charging
+            if self.connected_ev:
+                self.connected_ev.battery.charge(0)
+                self.connected_ev.aux_battery.charge(0)
 
     def next_time_step(self):
         r"""Advance to next `time_step` and set `electricity_consumption` at new `time_step` to 0.0."""

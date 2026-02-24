@@ -684,3 +684,347 @@ class SecondaryStorageReward(RewardFunction):
         self.previous_secondary_storage_soc = secondary_storage_soc
         
         return rewards
+
+
+class V2GSecondaryStorageReward(V2GPenaltyReward):
+    """Reward function for V2G environments with secondary storage integration.
+
+    Extends V2GPenaltyReward with secondary storage incentives so the agent
+    learns to coordinate EV charging, building consumption, AND the
+    centralized battery simultaneously.
+
+    Secondary storage logic follows the same sign convention as the rest
+    of CityLearn:
+        * net_electricity_consumption < 0  →  building has **surplus**
+        * net_electricity_consumption > 0  →  building has **deficit**
+        * secondary_storage action > 0     →  **charge** the battery
+        * secondary_storage action < 0     →  **discharge** the battery
+
+    The reward teaches agents to:
+        1. Push surplus energy into secondary storage (charge when surplus).
+        2. Pull energy from secondary storage when in deficit (discharge when deficit).
+        3. Avoid wasteful actions (charging SS when deficit, discharging when surplus).
+        4. Keep the secondary storage SOC in a healthy operating range.
+        5. Coordinate across buildings via a community-level SS bonus.
+
+    Parameters
+    ----------
+    env : CityLearnEnv
+        CityLearn environment.
+    ss_surplus_charge_weight : float
+        Reward weight for charging SS when the building has surplus.
+    ss_deficit_discharge_weight : float
+        Reward weight for discharging SS when the building has deficit.
+    ss_wrong_action_penalty : float
+        Penalty weight for taking the wrong SS action (charge during deficit
+        or discharge during surplus).
+    ss_soc_balance_weight : float
+        Reward/penalty weight for keeping SS SOC in a healthy range.
+    ss_community_coordination_weight : float
+        Bonus weight for good community-level coordination through SS.
+    ss_solar_storage_weight : float
+        Bonus weight for storing solar surplus into SS.
+    """
+
+    def __init__(self, env,
+                 # --- original V2GPenaltyReward params ---
+                 peak_percentage_threshold=0.10,
+                 ramping_percentage_threshold=0.10,
+                 peak_penalty_weight=20,
+                 ramping_penalty_weight=15,
+                 energy_transfer_bonus=10,
+                 window_size=6,
+                 penalty_no_car_charging=-5,
+                 penalty_battery_limits=-2,
+                 penalty_soc_under_5_10=-5,
+                 reward_close_soc=10,
+                 reward_self_ev_consumption=5,
+                 community_weight=0.2,
+                 reward_extra_self_production=5,
+                 squash=0,
+                 # --- secondary storage params ---
+                 ss_correct_action_weight=18.0,
+                 ss_wrong_action_penalty=-12.0,
+                 ss_constraint_penalty=-8.0,
+                 ss_idle_penalty=-2.0,
+                 ss_soc_health_weight=1.0,
+                 ss_solar_capture_weight=1.5,
+                 ss_pricing_weight=1.0,
+                 ss_community_coordination_weight=0.2,
+                 ss_action_guidance_weight=10.0,
+                 ss_reward_clip=25.0,
+                 ev_penalty_cap=10.0):
+
+        super().__init__(
+            env,
+            peak_percentage_threshold=peak_percentage_threshold,
+            ramping_percentage_threshold=ramping_percentage_threshold,
+            peak_penalty_weight=peak_penalty_weight,
+            ramping_penalty_weight=ramping_penalty_weight,
+            energy_transfer_bonus=energy_transfer_bonus,
+            window_size=window_size,
+            penalty_no_car_charging=penalty_no_car_charging,
+            penalty_battery_limits=penalty_battery_limits,
+            penalty_soc_under_5_10=penalty_soc_under_5_10,
+            reward_close_soc=reward_close_soc,
+            reward_self_ev_consumption=reward_self_ev_consumption,
+            community_weight=community_weight,
+            reward_extra_self_production=reward_extra_self_production,
+            squash=squash,
+        )
+
+        # Secondary storage weights
+        self.SS_CORRECT_ACTION_WEIGHT = ss_correct_action_weight
+        self.SS_WRONG_ACTION_PENALTY = ss_wrong_action_penalty
+        self.SS_CONSTRAINT_PENALTY = ss_constraint_penalty
+        self.SS_IDLE_PENALTY = ss_idle_penalty
+        self.SS_SOC_HEALTH_WEIGHT = ss_soc_health_weight
+        self.SS_SOLAR_CAPTURE_WEIGHT = ss_solar_capture_weight
+        self.SS_PRICING_WEIGHT = ss_pricing_weight
+        self.SS_COMMUNITY_COORDINATION_WEIGHT = ss_community_coordination_weight
+        self.SS_ACTION_GUIDANCE_WEIGHT = ss_action_guidance_weight
+        self.SS_REWARD_CLIP = ss_reward_clip
+        self.EV_PENALTY_CAP = ev_penalty_cap
+
+        # Running stats for adaptive pricing
+        self._ss_price_stat = RunningStat()
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _has_secondary_storage(self) -> bool:
+        return (hasattr(self.env, 'secondary_storage')
+                and self.env.secondary_storage is not None)
+
+    def _get_ss_soc(self) -> float:
+        if self._has_secondary_storage():
+            return self.env.secondary_storage.soc
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # per-building secondary storage reward
+    # ------------------------------------------------------------------
+
+    def _get_hour(self, b) -> int:
+        """Get current hour from building observation metadata."""
+        try:
+            return int(b.energy_simulation.hour[b.time_step]) if hasattr(b.energy_simulation, 'hour') else -1
+        except (IndexError, AttributeError):
+            return -1
+
+    def _get_price(self, b) -> float:
+        """Get current electricity price for a building."""
+        try:
+            return b.pricing.electricity_pricing[b.time_step]
+        except (IndexError, AttributeError):
+            return 0.0
+
+    def _get_avg_future_price(self, b, horizon: int = 6) -> float:
+        """Get average electricity price over the next `horizon` hours."""
+        try:
+            ts = b.time_step
+            prices = b.pricing.electricity_pricing[ts:ts + horizon]
+            return float(np.mean(prices)) if len(prices) > 0 else self._get_price(b)
+        except (IndexError, AttributeError):
+            return self._get_price(b)
+
+    def calculate_ss_reward(self, b, current_reward, net_energy) -> float:
+        """Calculate secondary storage reward/penalty for a single building.
+
+        Design principles for high action correctness:
+        - Strong, clear binary signal: correct action = big positive, wrong = big negative
+        - No magnitude scaling on core signal (avoids weakening when consumption is low)
+        - Constraint penalties for physically impossible actions
+        - Secondary bonuses (solar, pricing) are small and additive
+        - All components bounded via tanh before weighting
+
+        Parameters
+        ----------
+        b : Building
+            The building being evaluated.
+        current_reward : float
+            The building reward computed so far (used for context only).
+        net_energy : float
+            ``b.net_electricity_consumption[b.time_step]``.
+
+        Returns
+        -------
+        float
+            Reward adjustment clipped to [-SS_REWARD_CLIP, +SS_REWARD_CLIP].
+        """
+        if not self._has_secondary_storage():
+            return 0.0
+
+        ss_action = getattr(b, 'secondary_storage_request', 0.0)
+        ss_soc = self._get_ss_soc()
+        reward = 0.0
+        abs_action = abs(ss_action)
+        action_active = abs_action > 0.02  # dead-zone threshold
+
+        # ================================================================
+        # 0. EXPLICIT ACTION GUIDANCE (new dominant signal)
+        #    Direct binary reward: surplus→charge=good, deficit→discharge=good
+        #    This is the clearest possible signal for the agent
+        # ================================================================
+        if net_energy < -0.5:  # SURPLUS exists
+            if ss_action > 0.02:  # charging = correct
+                reward += self.SS_ACTION_GUIDANCE_WEIGHT
+            elif ss_action < -0.02:  # discharging = wrong
+                reward -= self.SS_ACTION_GUIDANCE_WEIGHT
+        elif net_energy > 0.5:  # DEFICIT exists
+            if ss_action < -0.02:  # discharging = correct
+                reward += self.SS_ACTION_GUIDANCE_WEIGHT
+            elif ss_action > 0.02:  # charging = wrong
+                reward -= self.SS_ACTION_GUIDANCE_WEIGHT
+
+        # ================================================================
+        # 1. CORE: Correct / Wrong action signal (scaled by magnitude)
+        #    Rewards larger actions more than smaller ones
+        # ================================================================
+        if net_energy < -0.5:  # SURPLUS — should charge (action > 0)
+            if ss_action > 0.02:
+                # Correct: charging during surplus — scale by action size
+                reward += self.SS_CORRECT_ACTION_WEIGHT * np.tanh(ss_action * 3)
+            elif ss_action < -0.02:
+                # Wrong: discharging during surplus
+                reward += self.SS_WRONG_ACTION_PENALTY * np.tanh(abs_action * 3)
+            elif not action_active:
+                # Missed opportunity: surplus available but idle
+                reward += self.SS_IDLE_PENALTY
+
+        elif net_energy > 0.5:  # DEFICIT — should discharge (action < 0)
+            if ss_action < -0.02:
+                # Correct: discharging during deficit — scale by action size
+                reward += self.SS_CORRECT_ACTION_WEIGHT * np.tanh(abs_action * 3)
+            elif ss_action > 0.02:
+                # Wrong: charging during deficit
+                reward += self.SS_WRONG_ACTION_PENALTY * np.tanh(abs_action * 3)
+            elif not action_active:
+                # Missed opportunity: deficit but idle
+                reward += self.SS_IDLE_PENALTY
+
+        else:  # BALANCED — small penalty for unnecessary action
+            if action_active:
+                reward -= 0.3 * abs_action
+
+        # ================================================================
+        # 2. SS Constraint penalties — physically impossible actions
+        #    Stronger penalties to prevent constraint violations
+        # ================================================================
+        # Trying to charge when battery is full
+        if ss_soc > 0.95 and ss_action > 0.02:
+            reward += self.SS_CONSTRAINT_PENALTY * np.tanh(ss_action * 4)
+        # Trying to discharge when battery is empty
+        if ss_soc < 0.05 and ss_action < -0.02:
+            reward += self.SS_CONSTRAINT_PENALTY * np.tanh(abs_action * 4)
+        # Charging during surplus but battery already nearly full (diminishing returns)
+        if ss_soc > 0.85 and ss_action > 0.02 and net_energy < -0.5:
+            reward -= 1.0 * np.tanh(ss_action * 3)
+        # Discharging during deficit but battery nearly empty
+        if ss_soc < 0.15 and ss_action < -0.02 and net_energy > 0.5:
+            reward -= 1.0 * np.tanh(abs_action * 3)
+
+        # ================================================================
+        # 3. SOC health — simple healthy-band bonus
+        # ================================================================
+        if 0.15 <= ss_soc <= 0.85:
+            reward += self.SS_SOC_HEALTH_WEIGHT * 0.5  # small constant bonus
+        elif ss_soc < 0.05 or ss_soc > 0.95:
+            reward -= self.SS_SOC_HEALTH_WEIGHT  # penalty at extremes
+
+        # ================================================================
+        # 4. Solar capture bonus — charge SS when solar surplus exists
+        # ================================================================
+        try:
+            solar_gen = abs(b.solar_generation[b.time_step])
+        except (IndexError, AttributeError):
+            solar_gen = 0.0
+        if solar_gen > 0.5 and net_energy < -0.5 and ss_action > 0.02:
+            reward += self.SS_SOLAR_CAPTURE_WEIGHT * np.tanh(ss_action * 2)
+
+        # ================================================================
+        # 5. Pricing-aware bonus — charge cheap, discharge expensive
+        # ================================================================
+        current_price = self._get_price(b)
+        self._ss_price_stat.push(current_price)
+
+        if self._ss_price_stat.n > 48:  # wait for stable stats
+            price_mean = self._ss_price_stat.mean
+            price_std = max(self._ss_price_stat.standard_deviation, 0.001)
+            price_z = (current_price - price_mean) / price_std
+
+            if price_z < -0.5 and ss_action > 0.02:  # cheap → charge
+                reward += self.SS_PRICING_WEIGHT * np.tanh(ss_action * 2)
+            elif price_z > 0.5 and ss_action < -0.02:  # expensive → discharge
+                reward += self.SS_PRICING_WEIGHT * np.tanh(abs_action * 2)
+
+        # ================================================================
+        # Clip total SS reward
+        # ================================================================
+        return float(np.clip(reward, -self.SS_REWARD_CLIP, self.SS_REWARD_CLIP))
+
+    # ------------------------------------------------------------------
+    # community-level secondary storage coordination
+    # ------------------------------------------------------------------
+
+    def calculate_community_reward(self, buildings, rewards) -> List[float]:
+        """Extend the V2G community reward with secondary storage coordination.
+
+        Community bonus: reward when buildings collectively take correct SS
+        actions (surplus→charge, deficit→discharge). Scales with agreement.
+        """
+        updated_rewards = super().calculate_community_reward(buildings, rewards)
+
+        if not self._has_secondary_storage():
+            return updated_rewards
+
+        n = len(buildings)
+        if n == 0:
+            return updated_rewards
+
+        correct_actions = 0
+        actionable = 0
+
+        for b in buildings:
+            net = b.net_electricity_consumption[b.time_step]
+            ss_action = getattr(b, 'secondary_storage_request', 0.0)
+            if abs(net) > 0.5:
+                actionable += 1
+                if net < -0.5 and ss_action > 0.02:
+                    correct_actions += 1
+                elif net > 0.5 and ss_action < -0.02:
+                    correct_actions += 1
+
+        if actionable == 0:
+            return updated_rewards
+
+        agreement_ratio = correct_actions / actionable
+        # Scale bonus linearly: 0 at 0% agreement, full at 100%
+        coordination_bonus = self.SS_COMMUNITY_COORDINATION_WEIGHT * agreement_ratio * 5.0
+        coordination_bonus = float(np.clip(coordination_bonus, 0.0, 3.0))
+        updated_rewards = [r + coordination_bonus for r in updated_rewards]
+
+        return updated_rewards
+
+    # ------------------------------------------------------------------
+    # override building reward to include SS
+    # ------------------------------------------------------------------
+
+    def calculate_building_reward(self, b) -> float:
+        """Building reward = V2G base reward (capped) + secondary storage reward.
+
+        The EV penalty from the base class can produce huge negative values
+        that drown out the SS signal.  We cap the EV-penalty contribution
+        so the agent can still learn from the SS reward.
+        """
+        net_energy = b.net_electricity_consumption[b.time_step]
+        base_reward = super().calculate_building_reward(b)
+
+        # Cap the base reward's negative side to prevent EV penalties
+        # from overwhelming the SS learning signal
+        if base_reward < -self.EV_PENALTY_CAP:
+            base_reward = -self.EV_PENALTY_CAP
+
+        ss_reward = self.calculate_ss_reward(b, base_reward, net_energy)
+        return base_reward + ss_reward

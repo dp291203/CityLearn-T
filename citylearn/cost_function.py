@@ -407,19 +407,37 @@ class CostFunction:
     def secondary_storage_kpis(secondary_storage_soc: List[float],
                              secondary_storage_energy_balance: List[float],
                              net_electricity_consumption: List[float],
-                             building_surpluses: List[List[float]] = None) -> dict:
+                             building_surpluses: List[List[float]] = None,
+                             building_net_consumptions: List[List[float]] = None,
+                             building_ss_requests: List[List[float]] = None,
+                             electricity_prices: List[float] = None,
+                             solar_generation: List[float] = None,
+                             battery_capacity: float = 200.0,
+                             battery_efficiency: float = 0.95) -> dict:
         """Calculate comprehensive secondary storage KPIs.
         
         Parameters
         ----------
         secondary_storage_soc : List[float]
-            Secondary storage state of charge time series.
+            Secondary storage state of charge time series (fraction 0-1).
         secondary_storage_energy_balance : List[float]
-            Secondary storage energy balance time series.
+            Secondary storage energy balance time series (positive=charge, negative=discharge).
         net_electricity_consumption : List[float]
-            Net electricity consumption time series.
+            District-level net electricity consumption time series.
         building_surpluses : List[List[float]], optional
             Surplus energy for each building over time.
+        building_net_consumptions : List[List[float]], optional
+            Per-building net consumption time series. Each inner list is one building.
+        building_ss_requests : List[List[float]], optional
+            Per-building secondary storage action requests. Each inner list is one building.
+        electricity_prices : List[float], optional
+            Electricity pricing time series.
+        solar_generation : List[float], optional
+            Total solar generation time series.
+        battery_capacity : float
+            Battery capacity in kWh.
+        battery_efficiency : float
+            Battery round-trip efficiency.
             
         Returns
         -------
@@ -428,39 +446,260 @@ class CostFunction:
         """
         kpis = {}
         
-        # Basic utilization metrics
+        # ---- Basic utilization metrics ----
         utilization_metrics = CostFunction.secondary_storage_utilization(secondary_storage_soc)
         kpis.update(utilization_metrics)
         
-        # Efficiency metrics
+        # ---- Efficiency metrics ----
         kpis['storage_efficiency'] = CostFunction.secondary_storage_efficiency(
             secondary_storage_energy_balance, net_electricity_consumption
         )
         
-        # Energy sharing metrics
+        # ---- Energy sharing metrics ----
         if building_surpluses:
             kpis['energy_sharing_ratio'] = CostFunction.energy_sharing_ratio(
                 secondary_storage_energy_balance, building_surpluses
             )
         
-        # Energy flow metrics
+        # ---- Energy flow metrics ----
         if secondary_storage_energy_balance:
-            total_energy_flow = sum(abs(x) for x in secondary_storage_energy_balance)
-            charging_energy = sum(x for x in secondary_storage_energy_balance if x > 0)
-            discharging_energy = sum(abs(x) for x in secondary_storage_energy_balance if x < 0)
+            eb = secondary_storage_energy_balance
+            total_energy_flow = sum(abs(x) for x in eb)
+            charging_energy = sum(x for x in eb if x > 0)
+            discharging_energy = sum(abs(x) for x in eb if x < 0)
             
             kpis['total_energy_flow'] = total_energy_flow
             kpis['charging_energy'] = charging_energy
             kpis['discharging_energy'] = discharging_energy
             kpis['charge_discharge_ratio'] = (charging_energy / discharging_energy 
                                             if discharging_energy > 0 else 0.0)
+            
+            # Round-trip efficiency: energy_out / energy_in
+            kpis['round_trip_efficiency'] = (discharging_energy / charging_energy
+                                            if charging_energy > 0 else 0.0)
+            
+            # Idle time: fraction of steps with no significant action
+            idle_steps = sum(1 for x in eb if abs(x) < 0.1)
+            kpis['idle_fraction'] = idle_steps / len(eb) if len(eb) > 0 else 1.0
+            
+            # Average charge/discharge power
+            charge_steps = [x for x in eb if x > 0.1]
+            discharge_steps = [abs(x) for x in eb if x < -0.1]
+            kpis['avg_charging_power'] = np.mean(charge_steps) if charge_steps else 0.0
+            kpis['avg_discharging_power'] = np.mean(discharge_steps) if discharge_steps else 0.0
         
-        # Performance indicators
+        # ---- Performance indicators ----
         if net_electricity_consumption:
-            peak_consumption = max(abs(x) for x in net_electricity_consumption)
-            average_consumption = np.mean([abs(x) for x in net_electricity_consumption])
+            nc = net_electricity_consumption
+            peak_consumption = max(abs(x) for x in nc)
+            average_consumption = np.mean([abs(x) for x in nc])
             kpis['peak_consumption'] = peak_consumption
             kpis['average_consumption'] = average_consumption
-            kpis['peak_to_average_ratio'] = peak_consumption / average_consumption if average_consumption > 0 else 0.0
+            kpis['peak_to_average_ratio'] = (peak_consumption / average_consumption 
+                                            if average_consumption > 0 else 0.0)
+        
+        # ---- Surplus capture rate ----
+        # What fraction of total surplus was captured into SS?
+        if building_net_consumptions and secondary_storage_energy_balance:
+            T = min(len(secondary_storage_energy_balance), 
+                    min(len(bc) for bc in building_net_consumptions))
+            total_surplus = 0.0
+            total_deficit = 0.0
+            for t in range(T):
+                for bc in building_net_consumptions:
+                    if bc[t] < 0:
+                        total_surplus += abs(bc[t])
+                    else:
+                        total_deficit += bc[t]
+            
+            charged = sum(x for x in secondary_storage_energy_balance[:T] if x > 0)
+            discharged = sum(abs(x) for x in secondary_storage_energy_balance[:T] if x < 0)
+            
+            kpis['surplus_capture_rate'] = min(charged / total_surplus, 1.0) if total_surplus > 0 else 0.0
+            kpis['deficit_coverage_rate'] = min(discharged / total_deficit, 1.0) if total_deficit > 0 else 0.0
+        
+        # ---- Action correctness ----
+        # Fraction of time steps where the SS action direction matches surplus/deficit
+        if building_net_consumptions and building_ss_requests:
+            n_buildings = len(building_net_consumptions)
+            T = min(len(building_net_consumptions[0]), len(building_ss_requests[0]))
+            correct = 0
+            total_actionable = 0
+            
+            for t in range(T):
+                for bi in range(n_buildings):
+                    net = building_net_consumptions[bi][t] if t < len(building_net_consumptions[bi]) else 0
+                    act = building_ss_requests[bi][t] if t < len(building_ss_requests[bi]) else 0
+                    if abs(net) > 0.5:  # only count when there's meaningful surplus/deficit
+                        total_actionable += 1
+                        if net < -0.5 and act > 0.02:  # surplus + charge = correct
+                            correct += 1
+                        elif net > 0.5 and act < -0.02:  # deficit + discharge = correct
+                            correct += 1
+            
+            kpis['action_correctness'] = correct / total_actionable if total_actionable > 0 else 0.0
+            kpis['actionable_steps'] = total_actionable
+            kpis['correct_action_steps'] = correct
+        
+        # ---- SOC health ratio ----
+        # Fraction of time SOC is in healthy range [0.1, 0.9]
+        if secondary_storage_soc:
+            healthy = sum(1 for s in secondary_storage_soc if 0.1 <= s <= 0.9)
+            kpis['soc_health_ratio'] = healthy / len(secondary_storage_soc)
+            
+            # SOC extremes
+            kpis['soc_min'] = min(secondary_storage_soc)
+            kpis['soc_max'] = max(secondary_storage_soc)
+            kpis['soc_final'] = secondary_storage_soc[-1]
+            
+            # Time at extreme SOC
+            empty_steps = sum(1 for s in secondary_storage_soc if s < 0.05)
+            full_steps = sum(1 for s in secondary_storage_soc if s > 0.95)
+            kpis['time_at_empty'] = empty_steps / len(secondary_storage_soc)
+            kpis['time_at_full'] = full_steps / len(secondary_storage_soc)
+        
+        # ---- Pricing-aware metrics ----
+        if electricity_prices and secondary_storage_energy_balance:
+            T = min(len(electricity_prices), len(secondary_storage_energy_balance))
+            charge_cost = 0.0
+            discharge_revenue = 0.0
+            for t in range(T):
+                price = electricity_prices[t]
+                eb_val = secondary_storage_energy_balance[t]
+                if eb_val > 0:  # charging
+                    charge_cost += price * eb_val
+                elif eb_val < 0:  # discharging
+                    discharge_revenue += price * abs(eb_val)
+            
+            kpis['charge_cost'] = charge_cost
+            kpis['discharge_revenue'] = discharge_revenue
+            kpis['arbitrage_profit'] = discharge_revenue - charge_cost
+            kpis['avg_charge_price'] = (charge_cost / kpis.get('charging_energy', 1.0)
+                                       if kpis.get('charging_energy', 0) > 0 else 0.0)
+            kpis['avg_discharge_price'] = (discharge_revenue / kpis.get('discharging_energy', 1.0)
+                                          if kpis.get('discharging_energy', 0) > 0 else 0.0)
+        
+        # ---- Solar utilization metrics ----
+        if solar_generation and secondary_storage_energy_balance:
+            T = min(len(solar_generation), len(secondary_storage_energy_balance))
+            solar_to_ss = 0.0
+            total_solar = sum(solar_generation[:T])
+            for t in range(T):
+                if solar_generation[t] > 0 and secondary_storage_energy_balance[t] > 0:
+                    solar_to_ss += min(solar_generation[t], secondary_storage_energy_balance[t])
+            kpis['solar_to_ss_ratio'] = solar_to_ss / total_solar if total_solar > 0 else 0.0
+            kpis['total_solar_generation'] = total_solar
+        
+        # ---- Demand response effectiveness ----
+        # How much does SS reduce peak demand compared to average?
+        if net_electricity_consumption and secondary_storage_energy_balance:
+            nc = net_electricity_consumption
+            T = min(len(nc), len(secondary_storage_energy_balance))
+            # Estimate what consumption would be without SS
+            nc_without_ss = [
+                nc[t] + secondary_storage_energy_balance[t] for t in range(T)
+            ]
+            peak_with = max(abs(x) for x in nc[:T]) if T > 0 else 0.0
+            peak_without = max(abs(x) for x in nc_without_ss) if T > 0 else 0.0
+            kpis['peak_reduction_ratio'] = (
+                (peak_without - peak_with) / peak_without
+                if peak_without > 0 else 0.0
+            )
+        
+        # ---- Self-sufficiency improvement ----
+        # Fraction of grid imports avoided by SS discharge
+        if net_electricity_consumption and secondary_storage_energy_balance:
+            T = min(len(net_electricity_consumption), len(secondary_storage_energy_balance))
+            grid_imports_with = sum(
+                max(net_electricity_consumption[t], 0) for t in range(T)
+            )
+            grid_imports_without = sum(
+                max(net_electricity_consumption[t] + secondary_storage_energy_balance[t], 0)
+                for t in range(T)
+            )
+            kpis['self_sufficiency_improvement'] = (
+                (grid_imports_without - grid_imports_with) / grid_imports_without
+                if grid_imports_without > 0 else 0.0
+            )
+        
+        # ---- Energy waste ratio ----
+        # Energy lost due to battery inefficiency
+        if secondary_storage_energy_balance:
+            eb = secondary_storage_energy_balance
+            total_in = sum(x for x in eb if x > 0)
+            total_out = sum(abs(x) for x in eb if x < 0)
+            energy_loss = total_in - total_out
+            kpis['energy_waste_kwh'] = max(energy_loss, 0.0)
+            kpis['energy_waste_ratio'] = (
+                max(energy_loss, 0.0) / total_in if total_in > 0 else 0.0
+            )
+        
+        # ---- Response rate ----
+        # Fraction of actionable steps where SS actually responded
+        if building_net_consumptions and building_ss_requests:
+            n_buildings = len(building_net_consumptions)
+            T = min(len(building_net_consumptions[0]), len(building_ss_requests[0]))
+            responded = 0
+            actionable = 0
+            for t in range(T):
+                for bi in range(n_buildings):
+                    net = building_net_consumptions[bi][t] if t < len(building_net_consumptions[bi]) else 0
+                    act = building_ss_requests[bi][t] if t < len(building_ss_requests[bi]) else 0
+                    if abs(net) > 0.5:
+                        actionable += 1
+                        if abs(act) > 0.02:
+                            responded += 1
+            kpis['response_rate'] = responded / actionable if actionable > 0 else 0.0
+        
+        # ---- Temporal arbitrage score ----
+        # Ratio of avg discharge price to avg charge price (>1 = profitable)
+        if electricity_prices and secondary_storage_energy_balance:
+            avg_cp = kpis.get('avg_charge_price', 0.0)
+            avg_dp = kpis.get('avg_discharge_price', 0.0)
+            kpis['temporal_arbitrage_score'] = (
+                avg_dp / avg_cp if avg_cp > 0 else 0.0
+            )
+        
+        # ---- Cycling depth ----
+        # Average SOC swing per charge/discharge cycle
+        if secondary_storage_soc and len(secondary_storage_soc) > 2:
+            soc_arr = np.array(secondary_storage_soc)
+            diffs = np.diff(soc_arr)
+            # Find direction changes (sign flips)
+            signs = np.sign(diffs)
+            sign_changes = np.where(signs[:-1] != signs[1:])[0]
+            if len(sign_changes) > 1:
+                cycle_depths = []
+                for i in range(len(sign_changes) - 1):
+                    start_idx = sign_changes[i]
+                    end_idx = sign_changes[i + 1]
+                    cycle_range = abs(soc_arr[start_idx] - soc_arr[end_idx])
+                    cycle_depths.append(cycle_range)
+                kpis['avg_cycling_depth'] = float(np.mean(cycle_depths)) if cycle_depths else 0.0
+                kpis['max_cycling_depth'] = float(np.max(cycle_depths)) if cycle_depths else 0.0
+                kpis['num_full_cycles'] = len(cycle_depths)
+            else:
+                kpis['avg_cycling_depth'] = 0.0
+                kpis['max_cycling_depth'] = 0.0
+                kpis['num_full_cycles'] = 0
+        
+        # ---- SS constraint violations ----
+        if secondary_storage_soc and building_ss_requests:
+            n_buildings = len(building_ss_requests)
+            T = min(len(secondary_storage_soc), min(len(r) for r in building_ss_requests))
+            charge_when_full = 0
+            discharge_when_empty = 0
+            for t in range(T):
+                soc = secondary_storage_soc[t]
+                avg_req = sum(building_ss_requests[bi][t] for bi in range(n_buildings)) / n_buildings
+                if soc > 0.95 and avg_req > 0.05:
+                    charge_when_full += 1
+                if soc < 0.05 and avg_req < -0.05:
+                    discharge_when_empty += 1
+            kpis['ss_charge_when_full_count'] = charge_when_full
+            kpis['ss_discharge_when_empty_count'] = discharge_when_empty
+            kpis['ss_constraint_violation_rate'] = (
+                (charge_when_full + discharge_when_empty) / T if T > 0 else 0.0
+            )
         
         return kpis

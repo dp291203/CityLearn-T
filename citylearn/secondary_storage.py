@@ -8,11 +8,18 @@ from citylearn.energy_model import Battery
 
 
 class SecondaryStorage(Environment):
-    """Dynamic secondary storage system for energy sharing between buildings.
-    
-    This class implements a centralized battery storage system that can be controlled
-    by agents through charge/discharge actions, similar to how EVs are handled.
-    
+    """Centralized battery storage for energy sharing between buildings.
+
+    Works like the electric_vehicle pattern: the Battery object owns the
+    soc list, and ``battery.charge()`` is called every time step so that
+    ``battery.soc[time_step]`` is always valid.
+
+    Sign convention (same as the rest of CityLearn):
+        * **net_electricity_consumption < 0** → building has *surplus*
+        * **net_electricity_consumption > 0** → building has *deficit*
+        * **action > 0** → charge the centralized battery
+        * **action < 0** → discharge the centralized battery
+
     Parameters
     ----------
     battery : Battery
@@ -26,9 +33,9 @@ class SecondaryStorage(Environment):
     **kwargs : Any
         Other keyword arguments used to initialize super class.
     """
-    
+
     def __init__(
-        self, 
+        self,
         battery: Battery,
         observation_metadata: Mapping[str, bool],
         action_metadata: Mapping[str, bool],
@@ -40,26 +47,29 @@ class SecondaryStorage(Environment):
         self.observation_metadata = observation_metadata
         self.action_metadata = action_metadata
         self.__observation_epsilon = 0.0
-        
-        # Initialize observation and action spaces
+
+        # observation / action spaces
         self.non_periodic_normalized_observation_space_limits = None
         self.periodic_normalized_observation_space_limits = None
         self.observation_space = self.estimate_observation_space()
         self.action_space = self.estimate_action_space()
-        
-        # Energy tracking
-        self.__electricity_consumption = []
-        self.__energy_balance = []
-        self.__net_energy_flow = []
-        self.__soc_history = []
-        
-        # Initialize parent class
+
+        # per-timestep tracking (mirrors Battery.energy_balance / soc)
+        self.__electricity_consumption = [0.0]
+        self.__energy_balance = [0.0]
+        self.__net_energy_flow = [0.0]
+
+        # initialize parent class
         arg_spec = inspect.getfullargspec(super().__init__)
         kwargs = {
             key: value for (key, value) in kwargs.items()
             if (key in arg_spec.args or (arg_spec.varkw is not None))
         }
         super().__init__(**kwargs)
+
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -127,7 +137,7 @@ class SecondaryStorage(Environment):
 
     @property
     def electricity_consumption(self) -> List[float]:
-        """Energy consumption/generation time series, in [kWh]."""
+        """Energy consumption time series, in [kWh]."""
         return self.__electricity_consumption
 
     @electricity_consumption.setter
@@ -146,11 +156,24 @@ class SecondaryStorage(Environment):
 
     @property
     def soc(self) -> float:
-        """Current state of charge as a fraction."""
-        battery_soc = self.battery.soc
-        if isinstance(battery_soc, list):
-            return battery_soc[-1] if battery_soc else 0.0
-        return battery_soc
+        """Current state of charge as a fraction (0-1).
+
+        Uses ``battery.soc[time_step]`` just like the EV pattern so the
+        value is always in sync with the simulation clock.
+        """
+        try:
+            soc_kwh = self.battery.soc[self.time_step]
+        except (IndexError, TypeError):
+            soc_kwh = self.battery.soc[-1] if self.battery.soc else 0.0
+        return soc_kwh / self.battery.capacity if self.battery.capacity > 0 else 0.0
+
+    @property
+    def soc_kwh(self) -> float:
+        """Current state of charge in kWh."""
+        try:
+            return self.battery.soc[self.time_step]
+        except (IndexError, TypeError):
+            return self.battery.soc[-1] if self.battery.soc else 0.0
 
     @property
     def capacity(self) -> float:
@@ -164,103 +187,66 @@ class SecondaryStorage(Environment):
 
     @property
     def soc_history(self) -> List[float]:
-        """State of charge history time series."""
-        return self.__soc_history
+        """Full soc list from the battery (in kWh), one entry per time step."""
+        return self.battery.soc
 
-    def charge(self, energy: float) -> float:
-        """Charge the secondary storage battery.
-        
-        Parameters
-        ----------
-        energy : float
-            Energy to charge in kWh (positive value).
-            
-        Returns
-        -------
-        float
-            Actual energy charged.
-        """
-        if energy <= 0:
-            return 0.0
-            
-        # Limit charging by available capacity and power constraints
-        current_soc = self.soc  # Use the property that handles list/float
-        max_charge = min(
-            energy,
-            self.battery.capacity * (1.0 - current_soc),  # Available capacity
-            self.battery.nominal_power  # Power constraint
-        )
-        
-        if max_charge > 0:
-            self.battery.charge(max_charge)
-            
-        return max_charge
-
-    def discharge(self, energy: float) -> float:
-        """Discharge the secondary storage battery.
-        
-        Parameters
-        ----------
-        energy : float
-            Energy to discharge in kWh (positive value).
-            
-        Returns
-        -------
-        float
-            Actual energy discharged.
-        """
-        if energy <= 0:
-            return 0.0
-            
-        # Limit discharging by available energy and power constraints
-        current_soc = self.soc  # Use the property that handles list/float
-        max_discharge = min(
-            energy,
-            self.battery.capacity * current_soc,  # Available energy
-            self.battery.nominal_power  # Power constraint
-        )
-        
-        if max_discharge > 0:
-            self.battery.charge(-max_discharge)  # Use negative energy for discharge
-            
-        return max_discharge
+    # ------------------------------------------------------------------
+    # actions  (mirrors how charger calls ev.battery.charge directly)
+    # ------------------------------------------------------------------
 
     def apply_actions(self, secondary_storage_action: float = 0.0, **kwargs):
-        """Apply secondary storage action.
-        
+        """Charge / discharge the battery for the current time step.
+
         Parameters
         ----------
         secondary_storage_action : float, default: 0.0
-            Fraction of battery capacity to charge/discharge by.
-            Positive values = charge, negative values = discharge.
+            Fraction of battery capacity to charge (+) or discharge (-).
+            Clamped to [-1, 1].
         """
         if 'secondary_storage_action' in kwargs:
             secondary_storage_action = kwargs['secondary_storage_action']
-            
-        # Convert action to energy amount
-        energy_amount = abs(secondary_storage_action) * self.battery.capacity
-        
-        if secondary_storage_action > 0:
-            # Charge
-            actual_energy = self.charge(energy_amount)
-            net_flow = actual_energy
-        elif secondary_storage_action < 0:
-            # Discharge
-            actual_energy = self.discharge(energy_amount)
-            net_flow = -actual_energy
-        else:
-            net_flow = 0.0
-            
-        # Update tracking variables
-        self.__net_energy_flow.append(net_flow)
-        self.__energy_balance.append(net_flow)
-        self.__electricity_consumption.append(net_flow)
-        self.__soc_history.append(self.soc)
 
-    def get_observations(self, include_all: bool = None, normalize: bool = None, 
-                        periodic_normalization: bool = None) -> Mapping[str, Union[int, float]]:
+        secondary_storage_action = max(-1.0, min(1.0, secondary_storage_action))
+
+        # convert fraction → kWh
+        energy = secondary_storage_action * self.battery.capacity
+
+        # Battery.charge handles all limits (capacity, power, efficiency,
+        # degradation) and appends to battery.soc & battery.energy_balance.
+        self.battery.charge(energy)
+
+        # record the *actual* energy that went in / out
+        actual = self.battery.energy_balance[-1]
+        self.__electricity_consumption[self.time_step] = abs(actual)
+        self.__energy_balance[self.time_step] = actual
+        self.__net_energy_flow[self.time_step] = actual
+
+    # ------------------------------------------------------------------
+    # time step management  (mirrors electric_vehicle.next_time_step)
+    # ------------------------------------------------------------------
+
+    def next_time_step(self):
+        """Advance to the next time step.
+
+        Calls ``battery.next_time_step()`` first (just like the EV does)
+        so that the battery's internal electricity_consumption list stays
+        in sync, then advances our own clock and appends zeros to our
+        tracking lists for the new step.
+        """
+        self.battery.next_time_step()
+        super().next_time_step()
+        self.__electricity_consumption.append(0.0)
+        self.__energy_balance.append(0.0)
+        self.__net_energy_flow.append(0.0)
+
+    # ------------------------------------------------------------------
+    # observations
+    # ------------------------------------------------------------------
+
+    def get_observations(self, include_all: bool = None, normalize: bool = None,
+                         periodic_normalization: bool = None) -> Mapping[str, Union[int, float]]:
         """Get secondary storage observations.
-        
+
         Parameters
         ----------
         include_all : bool, default: False
@@ -269,98 +255,96 @@ class SecondaryStorage(Environment):
             Whether to normalize observations.
         periodic_normalization : bool, default: False
             Whether to apply periodic normalization.
-            
+
         Returns
         -------
         dict
             Observation name to value mapping.
         """
         observations = {
-            'secondary_storage_soc': self.battery.soc,
+            'secondary_storage_soc': self.soc,
             'secondary_storage_capacity': self.battery.capacity,
             'secondary_storage_nominal_power': self.battery.nominal_power,
-            'secondary_storage_energy_balance': self.__energy_balance[-1] if self.__energy_balance else 0.0,
+            'secondary_storage_energy_balance': self.__energy_balance[self.time_step],
         }
-        
+
         if include_all:
             observations.update({
-                'secondary_storage_electricity_consumption': self.__electricity_consumption[-1] if self.__electricity_consumption else 0.0,
-                'secondary_storage_net_energy_flow': self.__net_energy_flow[-1] if self.__net_energy_flow else 0.0,
+                'secondary_storage_electricity_consumption': self.__electricity_consumption[self.time_step],
+                'secondary_storage_net_energy_flow': self.__net_energy_flow[self.time_step],
             })
-            
+
         return observations
 
+    # ------------------------------------------------------------------
+    # spaces
+    # ------------------------------------------------------------------
+
     def estimate_observation_space(self) -> spaces.Box:
-        """Get estimate of observation space.
-        
-        Returns
-        -------
-        observation_space : spaces.Box
-            Observation low and high limits.
-        """
+        """Get estimate of observation space."""
         low_limit, high_limit = [], []
-        
+
         for key in self.active_observations:
             if key == 'secondary_storage_soc':
                 low_limit.append(0.0)
                 high_limit.append(1.0)
             elif key == 'secondary_storage_capacity':
                 low_limit.append(0.0)
-                high_limit.append(self.battery.capacity * 1.1)  # 10% buffer
+                high_limit.append(self.battery.capacity * 1.1)
             elif key == 'secondary_storage_nominal_power':
                 low_limit.append(0.0)
-                high_limit.append(self.battery.nominal_power * 1.1)  # 10% buffer
-            elif key in ['secondary_storage_energy_balance', 'secondary_storage_electricity_consumption', 'secondary_storage_net_energy_flow']:
+                high_limit.append(self.battery.nominal_power * 1.1)
+            elif key in ['secondary_storage_energy_balance',
+                         'secondary_storage_electricity_consumption',
+                         'secondary_storage_net_energy_flow']:
                 low_limit.append(-self.battery.nominal_power)
                 high_limit.append(self.battery.nominal_power)
             else:
                 low_limit.append(-1.0)
                 high_limit.append(1.0)
-                
-        return spaces.Box(low=np.array(low_limit, dtype='float32'), high=np.array(high_limit, dtype='float32'))
+
+        return spaces.Box(
+            low=np.array(low_limit, dtype='float32'),
+            high=np.array(high_limit, dtype='float32'),
+        )
 
     def estimate_action_space(self) -> spaces.Box:
-        """Get estimate of action space.
-        
-        Returns
-        -------
-        action_space : spaces.Box
-            Action low and high limits.
-        """
+        """Get estimate of action space."""
         low_limit, high_limit = [], []
-        
+
         for key in self.active_actions:
             if key == 'secondary_storage':
-                # Action is fraction of capacity, bounded by power constraints
-                limit = self.battery.nominal_power / self.battery.capacity if self.battery.capacity > 0 else 1.0
-                low_limit.append(-limit)
-                high_limit.append(limit)
+                low_limit.append(-1.0)
+                high_limit.append(1.0)
             else:
                 low_limit.append(-1.0)
                 high_limit.append(1.0)
-                
-        return spaces.Box(low=np.array(low_limit, dtype='float32'), high=np.array(high_limit, dtype='float32'))
+
+        return spaces.Box(
+            low=np.array(low_limit, dtype='float32'),
+            high=np.array(high_limit, dtype='float32'),
+        )
+
+    # ------------------------------------------------------------------
+    # autosize / reset
+    # ------------------------------------------------------------------
 
     def autosize_battery(self, **kwargs):
-        """Autosize battery for secondary storage.
-        
-        Other Parameters
-        ----------------
-        **kwargs : dict
-            Other keyword arguments parsed to battery autosize function.
-        """
-        # Default sizing for secondary storage
+        """Autosize battery for secondary storage."""
         if hasattr(self.battery, 'autosize'):
             self.battery.autosize(**kwargs)
 
     def reset(self):
         """Reset secondary storage to initial state."""
         super().reset()
-        self.__electricity_consumption = []
-        self.__energy_balance = []
-        self.__net_energy_flow = []
-        self.__soc_history = []
         self.battery.reset()
+        self.__electricity_consumption = [0.0]
+        self.__energy_balance = [0.0]
+        self.__net_energy_flow = [0.0]
+
+    # ------------------------------------------------------------------
+    # default metadata
+    # ------------------------------------------------------------------
 
     @staticmethod
     def get_default_observation_metadata() -> Mapping[str, bool]:

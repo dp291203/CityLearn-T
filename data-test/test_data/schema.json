@@ -15,7 +15,7 @@
         "capacity": 200.0,
         "nominal_power": 100.0,
         "efficiency": 0.95,
-        "initial_soc": 0.5
+        "initial_soc": 0.0
       }
     },
     "autosize": false,
@@ -244,12 +244,14 @@
     }
   },
   "reward_function": {
-    "type": "citylearn.reward_function.SecondaryStorageReward",
+    "type": "citylearn.reward_function.V2GSecondaryStorageReward",
     "attributes": {
-      "electricity_consumption_weight": 0.3,
-      "secondary_storage_weight": 0.4,
-      "energy_sharing_weight": 0.2,
-      "grid_interaction_weight": 0.1
+      "ss_surplus_charge_weight": 8.0,
+      "ss_deficit_discharge_weight": 6.0,
+      "ss_wrong_action_penalty": -3.0,
+      "ss_soc_balance_weight": 2.0,
+      "ss_community_coordination_weight": 0.15,
+      "ss_solar_storage_weight": 4.0
     }
   },
   "evs": {
